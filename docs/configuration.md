@@ -35,22 +35,26 @@ return config
 
 ---
 
-## Common Overrides
+## Language
 
-Start with the generated file and keep overrides small. Add only the settings you want to change:
+Kaku ships built-in English and Simplified Chinese (`zh-CN`) translations
+for its menus, command palette, AI overlay, and CLI TUIs. The selected
+language also nudges the AI Assistant to reply in the same language.
 
 ```lua
-config.font_size = 16
-config.window_background_opacity = 0.95
-
--- Choose one only if you do not want to follow macOS appearance:
--- config.color_scheme = "Kaku Dark"
--- config.color_scheme = "Kaku Light"
+config.language = "zh-CN"  -- default: Simplified Chinese
+config.language = "en"     -- force English
 ```
 
-Keep terminal behavior, appearance, key bindings, launch behavior, and other WezTerm-compatible settings in `kaku.lua`.
+Unsupported values fall back to English and emit a warning in the log.
+The macOS system menu bar (File / Edit / Window) is owned by the OS;
+it follows your system language and is **not** affected by
+`config.language`. Re-launch Kaku after changing the value.
 
-Manage Kaku Assistant settings with `kaku ai`. That command writes `~/.config/kaku/assistant.toml` for model, base URL, auth, API keys, and tool settings. The Lua/TOML split is intentional: `kaku.lua` stays compatible with WezTerm-style terminal configuration, while `assistant.toml` is managed by the AI setup flow.
+> **Note:** `kaku.lua` is loaded by the desktop app and the `kaku` CLI.
+> The standalone `k` chat CLI resolves its locale from the environment
+> only (`LC_ALL` / `LC_MESSAGES` / `LANG`); set those variables in your
+> shell rc to control `k`.
 
 ---
 

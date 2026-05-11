@@ -1,36 +1,42 @@
 //! User-visible strings for the Cmd+L AI overlay.
 //!
-//! Centralized so a brand / wording change is a single-file edit instead
-//! of a `grep` across `mod.rs`. Keep entries narrow (labels, headers,
-//! toast titles); long-form templates that interpolate values still live
-//! next to their `format!` call sites.
+//! Backed by `rust-i18n`. The accessor functions return `String` (not
+//! `&'static str`) because the underlying lookup is runtime; callers
+//! should clone-on-use rather than try to borrow these for `'static`
+//! contexts. Long-form templates that interpolate values still live next
+//! to their `format!` call sites — extract them only when they ship as
+//! standalone labels.
+//!
+//! Translation source: `locales/{en,zh-CN}.yml`, scope `ai`.
+
+use rust_i18n::t;
 
 /// Label printed at the top of a user-authored message.
 ///
 /// Matches what `cmd_export` writes as `User:` on disk; the overlay
-/// prefers the shorter "You" because horizontal space is tight.
+/// prefers the shorter "You" / "你" because horizontal space is tight.
 pub(crate) fn header_user() -> String {
-    "  You".to_string()
+    t!("ai.header.user").into_owned()
 }
 
 /// Label printed at the top of an assistant-authored message.
 pub(crate) fn header_assistant() -> String {
-    "  AI".to_string()
+    t!("ai.header.assistant").into_owned()
 }
 
 /// Title shown by the system notification when an approval is required
 /// and the Kaku window is unfocused.
 pub(crate) fn approval_notification_title() -> String {
-    "Kaku AI needs confirmation".to_string()
+    t!("ai.approval.title").into_owned()
 }
 
 /// Title shown by the system notification when a chat task finishes
 /// while the Kaku window is unfocused.
 pub(crate) fn task_complete_notification_title() -> String {
-    "Kaku AI task complete".to_string()
+    t!("ai.task_complete.title").into_owned()
 }
 
 /// Body shown by the task-complete system notification.
 pub(crate) fn task_complete_notification_body() -> String {
-    "The AI has finished responding.".to_string()
+    t!("ai.task_complete.body").into_owned()
 }

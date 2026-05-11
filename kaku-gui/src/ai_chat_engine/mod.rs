@@ -53,16 +53,16 @@ pub enum StreamMsg {
 
 // ── System prompt ─────────────────────────────────────────────────────────────
 
-/// Returns the static system prompt, optionally suffixed with the user's
-/// Soul identity.
+/// Returns the static system prompt, optionally suffixed with a language
+/// directive and the user's Soul identity.
 ///
 /// This is the single source of truth for both the Cmd+L overlay and the `k`
 /// CLI. The prompt is composed from six topical fragments under
 /// `assets/prompts/chat/` so each section can be reviewed in isolation. The
 /// stable bytes still qualify for Anthropic's prompt-cache discount because
-/// the fragments are concatenated in a fixed order and the Soul/Memory
-/// content is appended at the end (cache-unfriendly per-user content goes
-/// last).
+/// the fragments are concatenated in a fixed order; the language directive is
+/// intentionally considered "stable enough" (it changes only when the user
+/// flips `config.language`, which is a session-level decision).
 ///
 /// Dynamic fields (date, cwd, locale) are intentionally excluded; they are
 /// injected as a separate user message via `build_environment_message`.
@@ -82,14 +82,15 @@ pub(crate) fn build_system_prompt() -> String {
         )),
     ];
     let base = fragments.join("\n\n");
+    let language_directive = rust_i18n::t!("ai.prompt.respond_in_language").into_owned();
     let identity = crate::soul::load_for_prompt();
+
+    let with_language = format!("{base}\n\n{language_directive}");
+
     if identity.is_empty() {
-        base
+        with_language
     } else {
-        format!(
-            "{}\n\n---\n\nUSER IDENTITY (read-only, user-authored):\n{}",
-            base, identity
-        )
+        format!("{with_language}\n\n---\n\nUSER IDENTITY (read-only, user-authored):\n{identity}")
     }
 }
 
