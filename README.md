@@ -8,7 +8,7 @@
 <p align="center">
   <a href="https://github.com/zsyn666/Kaku-Chinese/stargazers"><img src="https://img.shields.io/github/stars/zsyn666/Kaku-Chinese?style=flat-square" alt="Stars"></a>
   <a href="https://github.com/zsyn666/Kaku-Chinese/releases"><img src="https://img.shields.io/github/v/tag/zsyn666/Kaku-Chinese?label=version&style=flat-square" alt="Version"></a>
-  <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPLv3-blue.svg?style=flat-square" alt="License"></a>
   <a href="https://github.com/zsyn666/Kaku-Chinese/commits"><img src="https://img.shields.io/github/commit-activity/m/zsyn666/Kaku-Chinese?style=flat-square" alt="Commits"></a>
   <a href="https://twitter.com/HiTw93"><img src="https://img.shields.io/badge/follow-Tw93-red?style=flat-square&logo=Twitter" alt="Twitter"></a>
 </p>
@@ -139,4 +139,6 @@ Big thanks to all contributors who helped build Kaku. Go follow them! ❤️
 
 ## License
 
-MIT License, feel free to enjoy and participate in open source.
+GNU General Public License v3.0 — see [LICENSE](LICENSE) for details.
+
+This is a fork of [Kaku](https://github.com/tw93/Kaku) (MIT) by [tw93](https://github.com/tw93). The original MIT-licensed code remains under its terms; new modifications and the combined work are distributed under GPLv3.
