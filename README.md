@@ -2,13 +2,14 @@
   <img src="https://gw.alipayobjects.com/zos/k/6h/dwarf.svg" width="120" />
   <h1>Kaku</h1>
   <p><em>A fast, out-of-the-box terminal built for AI coding.</em></p>
+  <p><strong>🇨🇳 中文版 — 默认启用简体中文 UI (设置 <code>config.language = "en"</code> 切回英文)</strong></p>
 </div>
 
 <p align="center">
-  <a href="https://github.com/tw93/Kaku/stargazers"><img src="https://img.shields.io/github/stars/tw93/Kaku?style=flat-square" alt="Stars"></a>
-  <a href="https://github.com/tw93/Kaku/releases"><img src="https://img.shields.io/github/v/tag/tw93/Kaku?label=version&style=flat-square" alt="Version"></a>
+  <a href="https://github.com/zsyn666/Kaku-Chinese/stargazers"><img src="https://img.shields.io/github/stars/zsyn666/Kaku-Chinese?style=flat-square" alt="Stars"></a>
+  <a href="https://github.com/zsyn666/Kaku-Chinese/releases"><img src="https://img.shields.io/github/v/tag/zsyn666/Kaku-Chinese?label=version&style=flat-square" alt="Version"></a>
   <a href="LICENSE.md"><img src="https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square" alt="License"></a>
-  <a href="https://github.com/tw93/Kaku/commits"><img src="https://img.shields.io/github/commit-activity/m/tw93/Kaku?style=flat-square" alt="Commits"></a>
+  <a href="https://github.com/zsyn666/Kaku-Chinese/commits"><img src="https://img.shields.io/github/commit-activity/m/zsyn666/Kaku-Chinese?style=flat-square" alt="Commits"></a>
   <a href="https://twitter.com/HiTw93"><img src="https://img.shields.io/badge/follow-Tw93-red?style=flat-square&logo=Twitter" alt="Twitter"></a>
 </p>
 
