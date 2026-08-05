@@ -1,4 +1,16 @@
+#[cfg(target_os = "macos")]
 mod macos;
+
+#[cfg(target_os = "macos")]
+use macos as backend;
+
+#[cfg(not(target_os = "macos"))]
+mod backend {
+    use super::ToastNotification;
+    pub fn show_notif(_notif: ToastNotification) -> Result<(), String> {
+        Err("notifications are only supported on macOS".to_string())
+    }
+}
 
 use std::sync::Mutex;
 
@@ -15,8 +27,6 @@ impl ToastNotification {
         show(self)
     }
 }
-
-use macos as backend;
 
 pub fn show(notif: ToastNotification) {
     if let Err(err) = backend::show_notif(notif) {
