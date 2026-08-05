@@ -104,6 +104,61 @@ fn manual_drag_window_top_left(start: &MouseEvent, event: &MouseEvent) -> ::wind
     )
 }
 
+#[derive(Default)]
+struct OptionClickRowInfo {
+    wrapped: bool,
+    cells: Vec<(usize, usize)>,
+}
+
+/// Arrow sequence for a cursor move that is provably confined to one shell
+/// editing line. Hard-newline rows are ambiguous scrollback: emitting Up/Down
+/// there can mutate shell history rather than position the active prompt.
+fn option_click_cursor_bytes(
+    rows: &[OptionClickRowInfo],
+    cursor_row: usize,
+    cursor_col: usize,
+    target_row: usize,
+    target_col: usize,
+    application_cursor_keys: bool,
+) -> Vec<u8> {
+    if rows.is_empty() || cursor_row >= rows.len() || target_row >= rows.len() {
+        return Vec::new();
+    }
+
+    let (from, to) = if (cursor_row, cursor_col) <= (target_row, target_col) {
+        ((cursor_row, cursor_col), (target_row, target_col))
+    } else {
+        ((target_row, target_col), (cursor_row, cursor_col))
+    };
+    let same_row = from.0 == to.0;
+    let soft_wrapped_chain = rows[from.0..to.0].iter().all(|row| row.wrapped);
+    if !same_row && !soft_wrapped_chain {
+        return Vec::new();
+    }
+
+    let mut count = 0usize;
+    for (row_index, info) in rows.iter().enumerate().take(to.0 + 1).skip(from.0) {
+        for &(cell_index, width) in &info.cells {
+            let after_start = row_index > from.0 || cell_index + width > from.1;
+            let before_end = row_index < to.0 || cell_index < to.1;
+            if after_start && before_end {
+                count += 1;
+            }
+        }
+    }
+
+    let moving_right = (target_row, target_col) > (cursor_row, cursor_col);
+    // DECCKM (application cursor keys) changes the arrow encoding; inline
+    // raw-mode TUIs that enabled it expect SS3-style arrows.
+    let arrow: &[u8] = match (moving_right, application_cursor_keys) {
+        (true, false) => b"\x1b[C",
+        (false, false) => b"\x1b[D",
+        (true, true) => b"\x1bOC",
+        (false, true) => b"\x1bOD",
+    };
+    arrow.repeat(count)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TitleAreaZoomAction {
     Maximize,
@@ -173,7 +228,7 @@ enum SelectionDragWheelAction {
 /// terminal selection drag, and if so return the action that the configured
 /// [`SelectionWheelScrollBehavior`] resolves to.
 ///
-/// Returning `None` is the "not in a selection drag" signal — callers should
+/// Returning `None` is the "not in a selection drag" signal; callers should
 /// continue through the normal wheel routing path.
 ///
 /// `selection_drag_active` must come from the binding lookup: a left press in
@@ -687,7 +742,7 @@ impl super::TermWindow {
                     // drag-protection so follow-up motion/wheel isn't routed
                     // into terminal selection/scroll. Use terminal_origin_y
                     // rather than first_line_offset so the band of top
-                    // padding above row 0 isn't claimed as draggable — that
+                    // padding above row 0 isn't claimed as draggable; that
                     // band is part of the terminal pane (#356, 3-finger drag).
                     self.current_mouse_capture = Some(MouseCapture::UI);
                     self.window_drag.is_window_dragging = true;
@@ -1798,66 +1853,81 @@ impl super::TermWindow {
                     self.scroll_to_bottom(&pane);
                 }
 
-                // Option+Click: move cursor to the clicked column on the same line.
-                // Only fires when the shell owns the prompt (no mouse grab, no alt screen).
+                // Option+Click: move the terminal cursor to the clicked cell by
+                // synthesizing arrow keypresses, like iTerm2.
+                // Only fires when the shell owns the prompt (no mouse grab, no
+                // alt screen) and only for a clean click: the press falls
+                // through to start a block selection, so if the user dragged,
+                // a selection range exists by release time and we leave the
+                // event to the selection bindings instead.
                 if !pane.is_mouse_grabbed()
                     && !pane.is_alt_screen_active()
-                    && matches!(event.kind, WMEK::Press(MousePress::Left))
+                    && matches!(event.kind, WMEK::Release(MousePress::Left))
                     && modifiers.contains(window::Modifiers::ALT)
+                    && !modifiers.contains(window::Modifiers::SHIFT)
+                    && stable_row >= dims.physical_top
+                    && self.selection(pane.pane_id()).range.is_none()
                 {
                     let cursor = pane.get_cursor_position();
-                    if stable_row == cursor.y {
-                        let (from_col, to_col) = if column > cursor.x {
-                            (cursor.x, column)
-                        } else {
-                            (column, cursor.x)
-                        };
+                    let top = stable_row.min(cursor.y);
+                    let bottom = stable_row.max(cursor.y);
 
-                        // Count logical characters (not cells) between the two columns.
-                        // Wide chars (CJK etc.) occupy 2 cells but advance the cursor by 1 keypress.
-                        struct CountArrows {
-                            from_col: usize,
-                            to_col: usize,
-                            count: usize,
-                        }
-                        impl WithPaneLines for CountArrows {
-                            fn with_lines_mut(
-                                &mut self,
-                                _first_row: StableRowIndex,
-                                lines: &mut [&mut Line],
-                            ) {
-                                if let Some(line) = lines.first() {
-                                    for cell in line.visible_cells() {
-                                        let idx = cell.cell_index();
-                                        if idx < self.to_col && idx + cell.width() > self.from_col {
-                                            self.count += 1;
-                                        }
-                                    }
+                    #[derive(Default)]
+                    struct GatherRows {
+                        rows: Vec<OptionClickRowInfo>,
+                    }
+                    impl WithPaneLines for GatherRows {
+                        fn with_lines_mut(
+                            &mut self,
+                            _first_row: StableRowIndex,
+                            lines: &mut [&mut Line],
+                        ) {
+                            for line in lines.iter() {
+                                let mut info = OptionClickRowInfo {
+                                    wrapped: line.last_cell_was_wrapped(),
+                                    ..Default::default()
+                                };
+                                for cell in line.visible_cells() {
+                                    let idx = cell.cell_index();
+                                    let width = cell.width();
+                                    info.cells.push((idx, width));
                                 }
+                                self.rows.push(info);
                             }
                         }
+                    }
 
-                        let mut counter = CountArrows {
-                            from_col,
-                            to_col,
-                            count: 0,
-                        };
-                        pane.with_lines_mut(stable_row..stable_row + 1, &mut counter);
+                    let mut gather = GatherRows::default();
+                    pane.with_lines_mut(top..bottom + 1, &mut gather);
+                    let rows = gather.rows;
 
-                        if counter.count > 0 {
-                            let arrow: &[u8] = if column > cursor.x {
-                                b"\x1b[C"
-                            } else {
-                                b"\x1b[D"
-                            };
-                            let bytes: Vec<u8> = arrow.repeat(counter.count);
-                            if let Err(err) = self.write_terminal_input_bytes(&pane, &bytes) {
-                                log::debug!("option+click cursor move failed: {err:#}");
-                            }
-                            self.maybe_scroll_to_bottom_for_input(&pane);
+                    let cursor_row = (cursor.y - top) as usize;
+                    let target_row = (stable_row - top) as usize;
+                    let bytes = option_click_cursor_bytes(
+                        &rows,
+                        cursor_row,
+                        cursor.x,
+                        target_row,
+                        column,
+                        pane.application_cursor_keys_enabled(),
+                    );
+
+                    if !bytes.is_empty() {
+                        if let Err(err) = self.write_terminal_input_bytes(&pane, &bytes) {
+                            log::debug!("option+click cursor move failed: {err:#}");
                         }
+                        self.maybe_scroll_to_bottom_for_input(&pane);
+                        // The press started a block selection origin; drop it
+                        // so a later shift-click does not extend from a stale
+                        // point.
+                        self.selection(pane.pane_id()).clear();
                         return;
                     }
+                    // No movement was possible (e.g. the click crossed a hard
+                    // newline). Drop the stale selection origin but let the
+                    // release fall through so user Alt+LeftUp mouse bindings
+                    // stay reachable.
+                    self.selection(pane.pane_id()).clear();
                 }
 
                 // normalize delta and streak to make mouse assignment
@@ -2028,12 +2098,12 @@ fn wmek_to_tmek_and_button(event: &MouseEvent) -> (TMEK, TMB) {
 #[cfg(test)]
 mod tests {
     use super::{
-        manual_drag_window_top_left, mouse_dispatch_target, should_bypass_wheel_assignment_in_alt,
-        should_preserve_tmux_bypass_reporting, should_use_manual_window_drag,
-        should_use_native_maximized_window_drag, should_zoom_title_area,
-        tab_bar_item_starts_window_drag, title_area_double_click_zoom_action,
-        wheel_during_terminal_selection_action, MouseDispatchTarget, SelectionDragWheelAction,
-        TitleAreaZoomAction,
+        manual_drag_window_top_left, mouse_dispatch_target, option_click_cursor_bytes,
+        should_bypass_wheel_assignment_in_alt, should_preserve_tmux_bypass_reporting,
+        should_use_manual_window_drag, should_use_native_maximized_window_drag,
+        should_zoom_title_area, tab_bar_item_starts_window_drag,
+        title_area_double_click_zoom_action, wheel_during_terminal_selection_action,
+        MouseDispatchTarget, OptionClickRowInfo, SelectionDragWheelAction, TitleAreaZoomAction,
     };
     use crate::tabbar::TabBarItem;
     use crate::termwindow::MouseCapture;
@@ -2081,6 +2151,59 @@ mod tests {
         assert_eq!(
             manual_drag_window_top_left(&start, &start),
             euclid::point2(700, 300)
+        );
+    }
+
+    #[test]
+    fn option_click_never_crosses_a_hard_newline() {
+        let rows = vec![
+            OptionClickRowInfo {
+                wrapped: false,
+                cells: (0..5).map(|column| (column, 1)).collect(),
+            },
+            OptionClickRowInfo {
+                wrapped: false,
+                cells: (0..5).map(|column| (column, 1)).collect(),
+            },
+        ];
+
+        assert!(option_click_cursor_bytes(&rows, 1, 2, 0, 2, false).is_empty());
+        assert!(option_click_cursor_bytes(&rows, 0, 2, 1, 2, false).is_empty());
+    }
+
+    #[test]
+    fn option_click_uses_horizontal_arrows_across_soft_wraps() {
+        let rows = vec![
+            OptionClickRowInfo {
+                wrapped: true,
+                cells: vec![(0, 1), (1, 2), (3, 1)],
+            },
+            OptionClickRowInfo {
+                wrapped: false,
+                cells: vec![(0, 1), (1, 1)],
+            },
+        ];
+
+        assert_eq!(
+            option_click_cursor_bytes(&rows, 0, 1, 1, 1, false),
+            b"\x1b[C\x1b[C\x1b[C".to_vec()
+        );
+    }
+
+    #[test]
+    fn option_click_honors_application_cursor_keys() {
+        let rows = vec![OptionClickRowInfo {
+            wrapped: false,
+            cells: (0..5).map(|column| (column, 1)).collect(),
+        }];
+
+        assert_eq!(
+            option_click_cursor_bytes(&rows, 0, 1, 0, 3, true),
+            b"\x1bOC\x1bOC".to_vec()
+        );
+        assert_eq!(
+            option_click_cursor_bytes(&rows, 0, 3, 0, 1, true),
+            b"\x1bOD\x1bOD".to_vec()
         );
     }
 

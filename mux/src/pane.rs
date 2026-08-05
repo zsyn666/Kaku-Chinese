@@ -409,6 +409,12 @@ pub trait Pane: Downcast + Send + Sync {
     fn is_mouse_grabbed(&self) -> bool;
     fn is_alt_screen_active(&self) -> bool;
 
+    /// Whether DECCKM application cursor keys are enabled. Panes that cannot
+    /// inspect terminal state (remote client panes) report false.
+    fn application_cursor_keys_enabled(&self) -> bool {
+        false
+    }
+
     /// Primary Screen Peek: view primary screen history while in alt screen
     fn is_primary_peek(&self) -> bool {
         false

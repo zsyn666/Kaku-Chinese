@@ -94,6 +94,7 @@ fn run_chat(client: AiClient, req: AiRequest) {
         &model,
         &messages,
         &[],
+        false,
         &cancel,
         &mut move |tok: &str| {
             let _ = tx_tokens.send(AiEvent::AiToken {

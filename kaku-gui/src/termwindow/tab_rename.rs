@@ -801,12 +801,12 @@ impl TabRenameModal {
         let x = x.min(anchor_right - min_width).min(max_x).max(0.0);
 
         let row = Element::new(&font, ElementContent::Children(row))
-            .vertical_align(VerticalAlign::Bottom)
+            .vertical_align(VerticalAlign::Middle)
             .margin(BoxDimension {
                 left: Dimension::Pixels(0.0),
                 right: Dimension::Pixels(0.0),
-                top: Dimension::Pixels(0.5),
-                bottom: Dimension::Cells(0.1),
+                top: Dimension::Pixels(0.0),
+                bottom: Dimension::Cells(0.0),
             });
         let content_min_width = Self::content_min_extent(
             min_width,

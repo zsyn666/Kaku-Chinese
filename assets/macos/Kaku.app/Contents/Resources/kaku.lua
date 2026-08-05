@@ -271,6 +271,8 @@ local low_resolution_screen = (function()
   return false
 end)()
 
+-- These are device pixels, not points, and that is deliberate: `pt` doubles
+-- the visible gutter on a 2x display, which is where the spacing was tuned.
 local function get_default_padding()
   if low_resolution_screen then
     return { left = '26px', right = '26px', top = '26px', bottom = '0px' }
@@ -403,8 +405,12 @@ end
 local runtime_cwd_startup_grace_secs = 3
 local runtime_cwd_warmup_until_secs = now_secs() + runtime_cwd_startup_grace_secs
 
-local home_dir = os.getenv("HOME")
+local home_dir = os.getenv("HOME") or wezterm.home_dir
 local kaku_state_dir = home_dir and (home_dir .. "/.config/kaku") or nil
+local xdg_config_home = os.getenv("XDG_CONFIG_HOME")
+local kaku_config_dir = xdg_config_home and xdg_config_home ~= ""
+    and (xdg_config_home .. "/kaku")
+  or kaku_state_dir
 local lazygit_state_file = kaku_state_dir and (kaku_state_dir .. "/lazygit_state.json") or nil
 local last_cwd_file = kaku_state_dir and (kaku_state_dir .. "/last_cwd") or nil
 local last_saved_cwd = nil
@@ -531,7 +537,7 @@ local function strip_wrapping_quotes(value)
   return trimmed
 end
 
-local ai_fix_toml_path = kaku_state_dir and (kaku_state_dir .. "/assistant.toml") or nil
+local ai_fix_toml_path = kaku_config_dir and (kaku_config_dir .. "/assistant.toml") or nil
 local ai_fix_file_settings = {}
 
 local function strip_inline_toml_comment(line)
@@ -630,79 +636,6 @@ local function parse_ai_toml_int_set(raw_value)
   return set
 end
 
-local function parse_ai_toml_custom_headers(raw_value)
-  local value = trim_surrounding_whitespace(raw_value or "")
-  if value == "" then
-    return {}
-  end
-
-  if value:sub(1, 1) == "[" and value:sub(-1) == "]" then
-    local headers = {}
-    local content = trim_surrounding_whitespace(value:sub(2, -2))
-    if content ~= "" then
-      local token = {}
-      local in_double = false
-      local in_single = false
-      local escaped = false
-
-      local function flush_token()
-        local part = trim_surrounding_whitespace(table.concat(token))
-        token = {}
-        if part == "" then
-          return
-        end
-        local item = strip_wrapping_quotes(part)
-        if item ~= "" then
-          headers[#headers + 1] = item
-        end
-      end
-
-      local i = 1
-      while i <= #content do
-        local ch = content:sub(i, i)
-
-        if in_double then
-          token[#token + 1] = ch
-          if escaped then
-            escaped = false
-          elseif ch == "\\" then
-            escaped = true
-          elseif ch == '"' then
-            in_double = false
-          end
-        elseif in_single then
-          token[#token + 1] = ch
-          if ch == "'" then
-            in_single = false
-          end
-        else
-          if ch == "," then
-            flush_token()
-          else
-            token[#token + 1] = ch
-            if ch == '"' then
-              in_double = true
-            elseif ch == "'" then
-              in_single = true
-            end
-          end
-        end
-
-        i = i + 1
-      end
-
-      flush_token()
-    end
-    return headers
-  end
-
-  local single = strip_wrapping_quotes(value)
-  if single == "" then
-    return {}
-  end
-  return { single }
-end
-
 local function load_ai_fix_file_settings()
   local settings = {}
   if not ai_fix_toml_path or ai_fix_toml_path == "" then
@@ -721,9 +654,7 @@ local function load_ai_fix_file_settings()
         local key, raw_value = line:match("^%s*([%w_%-]+)%s*=%s*(.-)%s*$")
         if key and raw_value then
           local parsed = nil
-          if key == "custom_headers" then
-            parsed = parse_ai_toml_custom_headers(raw_value)
-          elseif key == "auto_fix_ignored_exit_codes" then
+          if key == "auto_fix_ignored_exit_codes" then
             parsed = parse_ai_toml_int_set(raw_value)
           else
             parsed = parse_ai_toml_setting_value(raw_value)
@@ -774,53 +705,6 @@ local function read_ai_setting(file_key, default_value)
   return value
 end
 
-local function parse_ai_custom_header_entry(raw_header)
-  if type(raw_header) ~= "string" then
-    return nil, nil
-  end
-
-  local trimmed = trim_surrounding_whitespace(raw_header)
-  if trimmed == "" then
-    return nil, nil
-  end
-
-  local colon_at = trimmed:find(":", 1, true)
-  if not colon_at or colon_at <= 1 then
-    return nil, nil
-  end
-
-  local name = trim_surrounding_whitespace(trimmed:sub(1, colon_at - 1))
-  local value = trim_surrounding_whitespace(trimmed:sub(colon_at + 1))
-  if name == "" or value == "" then
-    return nil, nil
-  end
-
-  return name .. ": " .. value, string.lower(name)
-end
-
-local function read_ai_custom_headers(file_key)
-  local raw_headers = ai_fix_file_settings[file_key]
-  if type(raw_headers) ~= "table" then
-    return {}
-  end
-
-  local headers = {}
-  local seen = {
-    ["authorization"] = true,
-    ["content-type"] = true,
-  }
-
-  for _, raw in ipairs(raw_headers) do
-    local parsed, name_key = parse_ai_custom_header_entry(raw)
-    if parsed and name_key and not seen[name_key] then
-      seen[name_key] = true
-      headers[#headers + 1] = parsed
-    end
-  end
-
-  return headers
-end
-
 local function read_ai_int_set(file_key)
   local raw_set = ai_fix_file_settings[file_key]
   if type(raw_set) ~= "table" then
@@ -851,46 +735,44 @@ end
 
 -- Keep cold startup fast: parse assistant.toml lazily only when AI fix is needed.
 local ai_fix_enabled = true
-local ai_fix_api_base_url = "https://api.openai.com/v1"
-local ai_fix_api_key = nil
-local ai_fix_model = "gpt-5.4-mini"
-local ai_fix_custom_headers = {}
-local ai_fix_proxy = nil
 local ai_fix_timeout_secs = 30
 local ai_fix_debug_enabled = false
 local ai_fix_ignored_exit_codes = {}
 local ai_fix_state_by_pane = {}
+local trusted_ai_last_command_by_pane = {}
 local ai_fix_poll_interval_secs = 0.2
 local ai_fix_poll_deadline_secs = ai_fix_timeout_secs + 4
 local ai_fix_jobs_dir = kaku_state_dir and (kaku_state_dir .. "/ai_jobs") or "/tmp"
 local ai_fix_job_counter = 0
+local ai_inline_not_configured_status = 78
 
 local function ai_debug_log(message)
   if not ai_fix_debug_enabled then
     return
   end
   local now = os.date("!%Y-%m-%dT%H:%M:%SZ")
-  local file = io.open("/tmp/kaku_ai_debug.log", "a")
+  if not kaku_state_dir then
+    return
+  end
+  local dir_status = os.execute(
+    string.format("mkdir -p %q && chmod 700 %q", kaku_state_dir, kaku_state_dir)
+  )
+  if dir_status ~= true and dir_status ~= 0 then
+    return
+  end
+  local debug_path = kaku_state_dir .. "/ai_debug.log"
+  local file = io.open(debug_path, "a")
   if not file then
     return
   end
   file:write(now .. " " .. tostring(message) .. "\n")
   file:close()
+  os.execute(string.format("chmod 600 %q", debug_path))
 end
 
 local function refresh_ai_fix_settings()
   ai_fix_file_settings = load_ai_fix_file_settings()
   ai_fix_enabled = read_ai_setting("enabled", ai_fix_enabled and "1" or "0") ~= "0"
-  ai_fix_api_base_url = read_ai_setting("base_url", ai_fix_api_base_url)
-  ai_fix_api_key = read_ai_setting("api_key", ai_fix_api_key)
-  ai_fix_model = read_ai_setting("model", ai_fix_model)
-  local legacy_fast_model = read_ai_setting("fast_model", "")
-  if legacy_fast_model ~= "" then
-    ai_fix_model = legacy_fast_model
-  end
-  ai_fix_custom_headers = read_ai_custom_headers("custom_headers")
-  local proxy_val = read_ai_setting("proxy", "")
-  ai_fix_proxy = (proxy_val ~= "") and proxy_val or nil
   local timeout_str = read_ai_setting("timeout_secs", tostring(ai_fix_timeout_secs))
   local timeout_num = tonumber(timeout_str)
   if timeout_num and timeout_num > 0 then
@@ -993,36 +875,11 @@ local function build_ai_fix_messages(failed_command, exit_code, cwd, git_branch,
   }
 end
 
-local function ai_fix_endpoint()
-  return trim_trailing_whitespace(ai_fix_api_base_url):gsub("/+$", "") .. "/chat/completions"
-end
-
-local function ai_fix_curl_header_args()
-  local args = {
-    "-H",
-    "Authorization: Bearer " .. ai_fix_api_key,
-    "-H",
-    "Content-Type: application/json",
-  }
-
-  for _, header in ipairs(ai_fix_custom_headers) do
-    args[#args + 1] = "-H"
-    args[#args + 1] = header
-  end
-
-  local _v = type(wezterm) == "table" and wezterm.version or ""
-  local _kaku_ver = trim_surrounding_whitespace(_v)
-  args[#args + 1] = "-H"
-  args[#args + 1] = "User-Agent: Kaku/" .. (_kaku_ver ~= "" and _kaku_ver or "unknown")
-
-  return args
-end
-
-local function encode_ai_fix_payload(model, messages)
+local function encode_ai_fix_payload(messages)
   local payload_ok, payload = pcall(wezterm.json_encode, {
-    model = model,
     messages = messages,
     stream = false,
+    timeout_secs = ai_fix_timeout_secs,
   })
   if not payload_ok or type(payload) ~= "string" or payload == "" then
     return nil, "failed to encode request payload"
@@ -1032,15 +889,18 @@ end
 
 local function next_ai_fix_job_id()
   ai_fix_job_counter = ai_fix_job_counter + 1
-  return tostring(now_secs()) .. "-" .. tostring(ai_fix_job_counter)
+  local timestamp = wezterm.time.now():format_utc("%s%f")
+  return timestamp .. "-" .. tostring(ai_fix_job_counter)
 end
 
 local function ensure_ai_fix_jobs_dir()
   if not ai_fix_jobs_dir or ai_fix_jobs_dir == "" then
     return false
   end
-  os.execute(string.format("mkdir -p %q", ai_fix_jobs_dir))
-  return true
+  local status = os.execute(
+    string.format("mkdir -p %q && chmod 700 %q", ai_fix_jobs_dir, ai_fix_jobs_dir)
+  )
+  return status == true or status == 0
 end
 
 -- Remove stale job files left behind by a previous crash or force-quit.
@@ -1074,7 +934,7 @@ local function cleanup_stale_ai_fix_jobs()
     out:close()
     due = true
   end)
-  if due then
+  if due and type(wezterm.background_child_process) == "function" then
     wezterm.background_child_process({
       "/usr/bin/find",
       ai_fix_jobs_dir,
@@ -1109,6 +969,16 @@ local function read_text_file(path)
   return content
 end
 
+local function read_text_file_limited(path, max_bytes)
+  local file = io.open(path, "r")
+  if not file then
+    return nil
+  end
+  local content = file:read(max_bytes)
+  file:close()
+  return content
+end
+
 local function cleanup_ai_fix_job_files(job)
   if not job or not job.paths then
     return
@@ -1119,7 +989,7 @@ local function cleanup_ai_fix_job_files(job)
   os.remove(job.paths.status_path)
 end
 
-local function start_ai_fix_background_job(payload)
+local function start_ai_fix_background_job(payload, window, pane)
   if not ensure_ai_fix_jobs_dir() then
     return nil, "state directory unavailable"
   end
@@ -1137,54 +1007,21 @@ local function start_ai_fix_background_job(payload)
     },
   }
 
+  cleanup_ai_fix_job_files(job)
   if not write_text_file(job.paths.request_path, payload) then
     return nil, "failed to write request payload"
   end
+  local chmod_status = os.execute(string.format("chmod 600 %q", job.paths.request_path))
+  if chmod_status ~= true and chmod_status ~= 0 then
+    cleanup_ai_fix_job_files(job)
+    return nil, "failed to secure request payload"
+  end
 
-  local curl_header_args = ai_fix_curl_header_args()
-
-  local script = [[
-status=0
-connect_timeout="$1"
-max_time="$2"
-url="$3"
-request_path="$4"
-response_path="$5"
-stderr_path="$6"
-status_path="$7"
-shift 7
-
-set -- -sS --fail --connect-timeout "$connect_timeout" --max-time "$max_time" "$url" "$@" \
-  --data-binary "@$request_path" \
-  -o "$response_path" \
-  --stderr "$stderr_path"
-
-curl "$@"
-status=$?
-printf '%s' "$status" > "$status_path"
-]]
   local launched_ok, launch_err = pcall(function()
-    local launch_args = {
-      "sh",
-      "-c",
-      script,
-      "kaku-ai-fix",
-      "3",
-      tostring(ai_fix_timeout_secs),
-      ai_fix_endpoint(),
-      job.paths.request_path,
-      job.paths.response_path,
-      job.paths.stderr_path,
-      job.paths.status_path,
-    }
-    for _, arg in ipairs(curl_header_args) do
-      launch_args[#launch_args + 1] = arg
-    end
-    if ai_fix_proxy then
-      launch_args[#launch_args + 1] = "--proxy"
-      launch_args[#launch_args + 1] = ai_fix_proxy
-    end
-    wezterm.background_child_process(launch_args)
+    window:perform_action(
+      wezterm.action.EmitEvent("kaku-ai-inline-request:" .. job.id),
+      pane
+    )
   end)
 
   if not launched_ok then
@@ -1630,11 +1467,20 @@ local function poll_ai_fix_job(window, pane, pane_id, job, failed_command, exit_
 
   local status_code = tonumber(status_value)
   local stdout = read_text_file(job.paths.response_path) or ""
-  local stderr = read_text_file(job.paths.stderr_path) or ""
+  local stderr = read_text_file_limited(job.paths.stderr_path, 8192) or ""
   cleanup_ai_fix_job_files(job)
 
   pane_state.inflight = false
   pane_state.pending_job_id = nil
+
+  if status_code == ai_inline_not_configured_status then
+    clear_ai_fix_suggestion_state(pane_state)
+    ai_debug_log("ai_fix_job skipped because assistant is not configured")
+    pcall(function()
+      window:perform_action(wezterm.action.EmitEvent("kaku-toast-ai-clear-progress"), pane)
+    end)
+    return
+  end
 
   if status_code ~= 0 then
     clear_ai_fix_suggestion_state(pane_state)
@@ -1651,7 +1497,6 @@ local function poll_ai_fix_job(window, pane, pane_id, job, failed_command, exit_
     return
   end
 
-  result.model = ai_fix_model
   pane_state.suggestion = result
   pane_state.failed_command = failed_command
   pane_state.exit_code = exit_code
@@ -1675,12 +1520,12 @@ end
 
 local function request_ai_fix_async(window, pane, pane_id, failed_command, exit_code, cwd, git_branch, terminal_output)
   local messages = build_ai_fix_messages(failed_command, exit_code, cwd, git_branch, terminal_output)
-  local payload, payload_err = encode_ai_fix_payload(ai_fix_model, messages)
+  local payload, payload_err = encode_ai_fix_payload(messages)
   if not payload then
     return nil, payload_err or "failed to encode request payload"
   end
 
-  local job, job_err = start_ai_fix_background_job(payload)
+  local job, job_err = start_ai_fix_background_job(payload, window, pane)
   if not job then
     return nil, job_err or "failed to start background request"
   end
@@ -1843,41 +1688,23 @@ local function poll_ai_generate_job(window, pane, pane_id, job)
 
   local status_code = tonumber(status_value)
   local stdout = read_text_file(job.paths.response_path) or ""
-  local stderr = read_text_file(job.paths.stderr_path) or ""
+  local stderr = read_text_file_limited(job.paths.stderr_path, 8192) or ""
   cleanup_ai_fix_job_files(job)
 
   pane_state.inflight = false
   pane_state.pending_job_id = nil
 
-  -- Retry helper: attempt one silent retry for transient API failures.
-  local function retry_or_fail(log_msg)
-    pane_state.retry_count = (pane_state.retry_count or 0)
-    if pane_state.retry_count < 1 then
-      pane_state.retry_count = pane_state.retry_count + 1
-      ai_debug_log("ai_generate_job retry pane_id=" .. pane_id .. " reason=" .. log_msg)
-      local query = pane_state.query or ""
-      local cwd = pane_state.cwd or ""
-      local git_branch = pane_state.git_branch or ""
-      local term_output = pane_state.terminal_output or ""
-      local mode = pane_state.mode or "auto"
-      pane_state.inflight = true
-      pane_state.spinner_frame = 0
-      local ok, err = request_ai_generate_async(window, pane, pane_id, query, cwd, git_branch, term_output, mode)
-      if not ok then
-        pane_state.inflight = false
-        ai_debug_log("ai_generate_job retry failed err=" .. tostring(err))
-        ctrl_ai_generate_spinner(pane, pane_state, true)
-        safe_send_clear(pane)
-        inject_ai_status_and_finalize(pane, "Could not generate command right now.")
-      end
-      return true
-    end
-    return false
+  if status_code == ai_inline_not_configured_status then
+    ctrl_ai_generate_spinner(pane, pane_state, true)
+    safe_send_clear(pane)
+    pcall(function()
+      window:perform_action(wezterm.action.EmitEvent("kaku-toast-ai-missing-key"), pane)
+    end)
+    return
   end
 
   if status_code ~= 0 then
     ai_debug_log("ai_generate_job failed pane_id=" .. pane_id .. " status=" .. tostring(status_code) .. " err=" .. tostring(stderr))
-    if retry_or_fail("non_zero_exit") then return end
     ctrl_ai_generate_spinner(pane, pane_state, true)
     safe_send_clear(pane)
     inject_ai_status_and_finalize(pane, "Could not generate command right now.")
@@ -1887,7 +1714,6 @@ local function poll_ai_generate_job(window, pane, pane_id, job)
   local result, parse_err = parse_ai_fix_response(stdout)
   if not result then
     ai_debug_log("ai_generate_job invalid_response pane_id=" .. pane_id .. " err=" .. tostring(parse_err))
-    if retry_or_fail("invalid_response") then return end
     ctrl_ai_generate_spinner(pane, pane_state, true)
     safe_send_clear(pane)
     inject_ai_status_and_finalize(pane, "Could not generate command right now.")
@@ -1979,12 +1805,12 @@ end
 
 local function request_ai_generate_async(window, pane, pane_id, query, cwd, git_branch, terminal_output, mode)
   local messages = build_ai_generate_messages(query, cwd, git_branch, terminal_output, mode)
-  local payload, payload_err = encode_ai_fix_payload(ai_fix_model, messages)
+  local payload, payload_err = encode_ai_fix_payload(messages)
   if not payload then
     return nil, payload_err or "failed to encode request payload"
   end
 
-  local job, job_err = start_ai_fix_background_job(payload)
+  local job, job_err = start_ai_fix_background_job(payload, window, pane)
   if not job then
     return nil, job_err or "failed to start background request"
   end
@@ -1993,7 +1819,7 @@ local function request_ai_generate_async(window, pane, pane_id, query, cwd, git_
   if pane_state then
     pane_state.pending_job_id = job.id
   end
-  ai_debug_log("ai_generate_job started pane_id=" .. pane_id .. " job_id=" .. job.id .. " model=" .. ai_fix_model .. " proxy=" .. tostring(ai_fix_proxy))
+  ai_debug_log("ai_generate_job started pane_id=" .. pane_id .. " job_id=" .. job.id)
 
   wezterm.time.call_after(ai_fix_poll_interval_secs, function()
     poll_ai_generate_job(window, pane, pane_id, job)
@@ -3296,6 +3122,11 @@ local function evict_stale_bell_panes(live_pane_ids)
       ai_fix_state_by_pane[pane_id] = nil
     end
   end
+  for pane_id in pairs(trusted_ai_last_command_by_pane) do
+    if not live_pane_ids[pane_id] then
+      trusted_ai_last_command_by_pane[pane_id] = nil
+    end
+  end
   for pane_id in pairs(ai_generate_state_by_pane) do
     if not live_pane_ids[pane_id] then
       ai_generate_state_by_pane[pane_id] = nil
@@ -3758,6 +3589,7 @@ wezterm.on('user-var-changed', function(window, pane, name, value)
     end
 
     local pane_id = tostring(pane_id_value)
+    trusted_ai_last_command_by_pane[pane_id] = trim_surrounding_whitespace(value or "")
     local pane_state = ai_fix_state_by_pane[pane_id]
     if not pane_state or not pane_state.inflight then
       return
@@ -3848,15 +3680,7 @@ wezterm.on('user-var-changed', function(window, pane, name, value)
     return
   end
 
-  local vars_ok, vars = pcall(function()
-    return pane:get_user_vars()
-  end)
-  if not vars_ok or type(vars) ~= "table" then
-    ai_debug_log("user-var-changed ignored no user vars")
-    return
-  end
-
-  local failed_command = trim_surrounding_whitespace(vars.kaku_last_cmd or "")
+  local failed_command = trusted_ai_last_command_by_pane[pane_id] or ""
   if failed_command == "" then
     ai_debug_log("user-var-changed ignored missing kaku_last_cmd")
     return
@@ -3883,11 +3707,6 @@ wezterm.on('user-var-changed', function(window, pane, name, value)
 
   if not ai_fix_enabled then
     ai_debug_log("user-var-changed ai_fix disabled after refresh")
-    return
-  end
-
-  if not ai_fix_api_key or ai_fix_api_key == "" then
-    ai_debug_log("user-var-changed missing api key after refresh")
     return
   end
 
@@ -3934,9 +3753,7 @@ wezterm.on('user-var-changed', function(window, pane, name, value)
   end
 
   -- The shell-integration widgets prepend "[mode:auto|explain|candidates] "
-  -- so we know whether the user typed '#', '#?', or '##'. Older widget
-  -- versions (or non-shell injectors) will pass the bare query and fall
-  -- through to mode=auto.
+  -- so we know whether the user typed '#', '#?', or '##'.
   local mode, query = raw:match("^%[mode:(%w+)%]%s*(.*)$")
   if not mode then
     mode = "auto"
@@ -3978,13 +3795,6 @@ wezterm.on('user-var-changed', function(window, pane, name, value)
   if not ai_fix_enabled then
     return
   end
-  if not ai_fix_api_key or ai_fix_api_key == "" then
-    pcall(function()
-      window:perform_action(wezterm.action.EmitEvent("kaku-toast-ai-missing-key"), pane)
-    end)
-    return
-  end
-
   if not is_shell_foreground(pane) then
     ai_debug_log("ai_generate skipped non-shell foreground pane_id=" .. pane_id)
     return
@@ -3995,9 +3805,6 @@ wezterm.on('user-var-changed', function(window, pane, name, value)
   pane_state.pending_job_id = nil
   pane_state.spinner_frame = 0
   pane_state.spinner_line_active = false
-  pane_state.retry_count = 0
-  pane_state.query = query:gsub("[%c]", "")
-  pane_state.mode = mode
 
   local cwd = pane_cwd(pane)
   local git_branch = detect_git_branch(cwd)
@@ -4005,9 +3812,6 @@ wezterm.on('user-var-changed', function(window, pane, name, value)
   pcall(function()
     terminal_output = pane:get_lines_as_text(30) or ""
   end)
-  pane_state.cwd = cwd
-  pane_state.git_branch = git_branch
-  pane_state.terminal_output = terminal_output
   local ok, err = request_ai_generate_async(window, pane, pane_id, query, cwd, git_branch, terminal_output, mode)
   if not ok then
     pane_state.inflight = false
@@ -4068,6 +3872,7 @@ local function build_font_config(is_light)
   local font = wezterm.font_with_fallback({
     { family = 'JetBrains Mono', weight = base_weight },
     { family = 'PingFang SC', weight = base_weight },
+    'Apple Symbols',
     'Apple Color Emoji',
   })
 
@@ -4078,6 +3883,7 @@ local function build_font_config(is_light)
       font = wezterm.font_with_fallback({
         { family = 'JetBrains Mono', weight = base_weight },
         { family = 'PingFang SC', weight = base_weight },
+        'Apple Symbols',
         'Apple Color Emoji',
       }),
     },
@@ -4088,6 +3894,7 @@ local function build_font_config(is_light)
       font = wezterm.font_with_fallback({
         { family = 'JetBrains Mono', weight = base_weight, italic = false },
         { family = 'PingFang SC', weight = base_weight },
+        'Apple Symbols',
         'Apple Color Emoji',
       }),
     },
@@ -4097,6 +3904,7 @@ local function build_font_config(is_light)
       font = wezterm.font_with_fallback({
         { family = 'JetBrains Mono', weight = bold_weight },
         { family = 'PingFang SC', weight = bold_weight },
+        'Apple Symbols',
         'Apple Color Emoji',
       }),
     },
@@ -4296,6 +4104,9 @@ config.cursor_blink_ease_out = 'Constant'
 -- ===== Scrollback =====
 config.scrollback_lines = 10000
 
+-- Optional editor for local file links. Kaku appends path[:line[:column]].
+-- config.file_link_editor = 'zed'
+
 -- ===== Text Selection =====
 config.selection_word_boundary = ' \t\n{}[]()"\'-'  -- Smart selection boundaries
 
@@ -4438,6 +4249,12 @@ config.color_schemes['Kaku Dark'] = {
     ['#6d6d6d'] = '#3A3942',  -- ANSI 8 (bright black)
     ['#6E6E6E'] = '#3A3942',  -- Claude Code true color
     ['#8EC3FF'] = '#3A3942',  -- Claude Code blue header background
+    -- ANSI 7/15 resolve to KAKU.WHITE, which is also `foreground`, so any
+    -- app painting default-colored text on a white background renders at
+    -- zero contrast. Claude Code's `dark-ansi` theme does exactly that for
+    -- the hovered user-message block. Keep the slot lighter than the
+    -- `#3A3942` used for ANSI 8 so hover still reads as a state change.
+    [KAKU.WHITE] = '#4A4954',  -- ANSI 7/15 (white) background
   },
 
   -- Hermes and some Rich/prompt_toolkit surfaces emit black truecolor text
@@ -4533,6 +4350,7 @@ config.color_schemes['Kaku Light'] = {
     ['#1C6C66'] = '#F2F0EB',  -- ANSI 6 (cyan bg): branch pill
     ['#536907'] = '#F2F0EB',  -- ANSI 2 (green bg): progress bar blocks
     ['#8E6B02'] = '#F2F0EB',  -- ANSI 3 (yellow bg): agent label background
+    ['#403E3C'] = '#E8E6DB',  -- ANSI 15 (bright white bg): hovered message block
   },
 
   -- Override pale agent text that is readable on dark themes but nearly
@@ -5049,7 +4867,6 @@ wezterm.on('gui-startup', function(cmd)
   lazygit_hint_warmup_until_secs = now_secs() + lazygit_hint_startup_grace_secs
   runtime_cwd_warmup_until_secs = now_secs() + runtime_cwd_startup_grace_secs
 
-  local home = os.getenv("HOME")
   local function read_current_config_version()
     local candidates = {
       wezterm.executable_dir:gsub("MacOS/?$", "Resources") .. "/config_version.txt",
@@ -5077,26 +4894,20 @@ wezterm.on('gui-startup', function(cmd)
 
   local current_version = read_current_config_version()
 
-  local state_file = home .. "/.config/kaku/state.json"
+  local state_file = kaku_config_dir .. "/state.json"
   local is_first_run = false
   local needs_update = false
 
   local function ensure_state_dir()
-    os.execute("mkdir -p " .. home .. "/.config/kaku")
+    os.execute(string.format("mkdir -p %q", kaku_config_dir))
   end
 
-  local function write_state(version, geometry)
+  local function write_state(version, state)
     ensure_state_dir()
-    local state = {
-      config_version = version,
-    }
-    if geometry and geometry.width and geometry.height then
-      state.window_geometry = {
-        width = geometry.width,
-        height = geometry.height,
-      }
-    end
-
+    state = type(state) == "table" and state or {}
+    state.config_version = version
+    local geometry = state.window_geometry
+    local managed_shell = state.managed_shell
     local encoded = nil
     local ok, value = pcall(wezterm.json_encode, state)
     if ok and type(value) == "string" and value ~= "" then
@@ -5110,10 +4921,18 @@ wezterm.on('gui-startup', function(cmd)
       else
         -- Manual JSON fallback when json_encode is unavailable.
         -- Include geometry if present so state is not lost.
-        if geometry and geometry.width and geometry.height then
+        if geometry and geometry.width and geometry.height and managed_shell then
+          wf:write(string.format(
+            '{\n  "config_version": %d,\n  "managed_shell": "%s",\n  "window_geometry": {\n    "width": %d,\n    "height": %d\n  }\n}\n',
+            version, managed_shell, geometry.width, geometry.height))
+        elseif geometry and geometry.width and geometry.height then
           wf:write(string.format(
             '{\n  "config_version": %d,\n  "window_geometry": {\n    "width": %d,\n    "height": %d\n  }\n}\n',
             version, geometry.width, geometry.height))
+        elseif managed_shell then
+          wf:write(string.format(
+            '{\n  "config_version": %d,\n  "managed_shell": "%s"\n}\n',
+            version, managed_shell))
         else
           wf:write(string.format('{\n  "config_version": %d\n}\n', version))
         end
@@ -5123,8 +4942,18 @@ wezterm.on('gui-startup', function(cmd)
   end
 
   local user_version = nil
+  local managed_shell = nil
+  local persisted_state = nil
   local state_file_exists = false
+  local loaded_legacy_state = false
   local sf = io.open(state_file, "r")
+  if not sf and kaku_config_dir ~= kaku_state_dir then
+    -- Pre-XDG releases stored state at ~/.config/kaku regardless of
+    -- XDG_CONFIG_HOME. Fall back so existing users are not re-onboarded;
+    -- the next write_state migrates the data to the XDG location.
+    sf = io.open(kaku_state_dir .. "/state.json", "r")
+    loaded_legacy_state = sf ~= nil
+  end
   if sf then
     state_file_exists = true
     local raw_state = sf:read("*all")
@@ -5132,7 +4961,11 @@ wezterm.on('gui-startup', function(cmd)
     if raw_state and raw_state ~= "" then
       local ok, state = pcall(wezterm.json_parse, raw_state)
       if ok and type(state) == "table" then
+        persisted_state = state
         user_version = tonumber(state.config_version)
+        if state.managed_shell == 'zsh' or state.managed_shell == 'fish' then
+          managed_shell = state.managed_shell
+        end
       end
     end
   end
@@ -5140,11 +4973,18 @@ wezterm.on('gui-startup', function(cmd)
   if not state_file_exists then
     is_first_run = true
   elseif user_version == nil then
-    -- Corrupted or manually edited state file: repair with safe defaults.
-    write_state(current_version, nil)
-    user_version = current_version
+    -- A GUI window writer or interrupted shell setup may have created useful
+    -- state without completing initialization. Keep it incomplete so first
+    -- run retries instead of manufacturing a successful current version.
+    is_first_run = true
   elseif user_version < current_version then
     needs_update = true
+  end
+
+  if loaded_legacy_state and user_version ~= nil then
+    -- Move the complete legacy object to XDG, including fields introduced by
+    -- newer writers that this bundled config does not know about.
+    write_state(user_version, persisted_state)
   end
 
   if is_first_run then

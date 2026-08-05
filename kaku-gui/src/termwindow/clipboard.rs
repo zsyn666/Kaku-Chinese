@@ -39,6 +39,13 @@ fn should_emit_ai_notice(kind: &str, message: &str) -> bool {
     true
 }
 
+fn is_ai_progress_toast(message: &str) -> bool {
+    matches!(
+        message,
+        "Kaku Assistant analyzing command" | "Kaku generating command"
+    )
+}
+
 impl TermWindow {
     pub fn copy_to_clipboard(&self, clipboard: ClipboardCopyDestination, text: String) {
         let text = if self.config.copy_strip_leading_whitespace {
@@ -120,6 +127,23 @@ impl TermWindow {
         }
         let clamped = lifetime_ms.clamp(1200, 8000);
         self.show_toast_internal(normalized, Duration::from_millis(clamped));
+    }
+
+    pub fn clear_ai_progress_toast(&mut self) {
+        let is_progress = self
+            .toast
+            .as_ref()
+            .map(|(_, message, _)| is_ai_progress_toast(message))
+            .unwrap_or(false);
+        if !is_progress {
+            return;
+        }
+
+        self.toast = None;
+        self.toast_shaped_width = None;
+        if let Some(window) = self.window.as_ref() {
+            window.invalidate();
+        }
     }
 
     /// Result notices prefer in-window toast when the window is focused;
@@ -299,4 +323,17 @@ fn strip_common_leading_whitespace(text: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_ai_progress_toast;
+
+    #[test]
+    fn only_ai_progress_toasts_are_clearable() {
+        assert!(is_ai_progress_toast("Kaku Assistant analyzing command"));
+        assert!(is_ai_progress_toast("Kaku generating command"));
+        assert!(!is_ai_progress_toast("Kaku Assistant is not configured"));
+        assert!(!is_ai_progress_toast("Copied"));
+    }
 }

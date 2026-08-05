@@ -960,7 +960,15 @@ pub fn grapheme_column_width(s: &str, version: Option<&UnicodeVersion>) -> usize
         // contain them. Visible "tiny emoji" was the worse user-facing bug.
         match Presentation::for_grapheme(s) {
             (_, Some(Presentation::Emoji)) => return 2,
-            (_, Some(Presentation::Text)) => return 1,
+            // FE0E (VS15) selects text presentation. That changes the glyph
+            // style, not the width the shell accounts for: libc wcwidth()
+            // knows nothing about variation selectors and still reports the
+            // base codepoint's width (e.g. ☕ U+2615 is East Asian Wide = 2).
+            // Fall through to the per-char summation below so the terminal
+            // model stays in sync with the shell's cursor arithmetic;
+            // forcing 1 here made every VS15-suffixed wide char drift the
+            // cursor by one cell.
+            (_, Some(Presentation::Text)) => {}
             (Presentation::Emoji, None) => return 2,
             (Presentation::Text, None) => {}
         }
@@ -1118,6 +1126,28 @@ mod test {
 
         let c = Cell::new_grapheme("\u{3000}", CellAttributes::blank(), None);
         assert_eq!(c.width(), 2);
+    }
+
+    #[test]
+    fn vs15_keeps_base_codepoint_width() {
+        // VS15 (text presentation) must not shrink East Asian Wide bases:
+        // libc wcwidth() ignores variation selectors, so the shell counts
+        // ☕ as 2 cells whether or not VS15 follows. Forcing these to 1
+        // desynced the cursor by one cell per character.
+        let coffee_text = "\u{2615}\u{fe0e}";
+        assert_eq!(unicode_column_width(coffee_text, None), 2);
+        let watch_text = "\u{231A}\u{fe0e}";
+        assert_eq!(unicode_column_width(watch_text, None), 2);
+        let thumbs_up_text = "\u{1F44D}\u{fe0e}";
+        assert_eq!(unicode_column_width(thumbs_up_text, None), 2);
+
+        // Narrow bases keep width 1 with VS15.
+        let heart_text = "\u{2665}\u{fe0e}";
+        assert_eq!(unicode_column_width(heart_text, None), 1);
+        let snowflake_text = "\u{2744}\u{fe0e}";
+        assert_eq!(unicode_column_width(snowflake_text, None), 1);
+        let timer_text = "\u{23F2}\u{fe0e}";
+        assert_eq!(unicode_column_width(timer_text, None), 1);
     }
 
     #[test]

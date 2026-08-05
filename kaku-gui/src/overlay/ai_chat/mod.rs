@@ -51,6 +51,7 @@ use self::state::App;
 use crate::ai_client::{AiClient, AssistantConfig};
 use mux::pane::PaneId;
 use mux::termwiztermtab::TermWizTerminal;
+use std::sync::mpsc::Receiver;
 use std::time::Duration;
 use termwiz::cell::CellAttributes;
 use termwiz::color::ColorAttribute;
@@ -82,6 +83,7 @@ pub fn ai_chat_overlay(
     _pane_id: PaneId,
     mut term: TermWizTerminal,
     context: TerminalContext,
+    palette_rx: Receiver<ChatPalette>,
 ) -> anyhow::Result<()> {
     term.set_raw_mode()?;
 
@@ -123,6 +125,14 @@ pub fn ai_chat_overlay(
     app.display_lines_dirty = true;
 
     loop {
+        if drain_palette_updates(
+            &palette_rx,
+            &mut app.context.colors,
+            &mut app.display_lines_dirty,
+        ) {
+            needs_redraw = true;
+        }
+
         // Drain any streaming tokens first.
         if app.drain_tokens() {
             needs_redraw = true;
@@ -258,4 +268,22 @@ pub fn ai_chat_overlay(
     crate::ai_tools::cleanup_spill_files();
 
     Ok(())
+}
+
+fn drain_palette_updates(
+    palette_rx: &Receiver<ChatPalette>,
+    colors: &mut ChatPalette,
+    display_lines_dirty: &mut bool,
+) -> bool {
+    let mut latest = None;
+    while let Ok(palette) = palette_rx.try_recv() {
+        latest = Some(palette);
+    }
+    let Some(palette) = latest else {
+        return false;
+    };
+
+    *colors = palette;
+    *display_lines_dirty = true;
+    true
 }

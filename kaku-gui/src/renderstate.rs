@@ -362,8 +362,18 @@ impl TripleVertexBuffer {
         }
     }
 
+    /// Number of vertices/indices to draw for this buffer.
+    ///
+    /// `next_quad` deliberately keeps counting past `capacity` so that
+    /// `need_more_quads()` can report the shortfall and grow the GPU
+    /// buffers. The staging layer only ever writes `capacity` quads worth
+    /// of vertices, and the index buffer only contains `capacity` quads
+    /// worth of indices, so the draw call must be clamped to the capacity.
+    /// Returning the unclamped count makes glium's `slice()` yield `None`
+    /// and wgpu raise `Index N extends beyond limit M`, aborting the
+    /// process on any frame that fails to converge.
     pub fn vertex_index_count(&self) -> (usize, usize) {
-        let num_quads = *self.next_quad.borrow();
+        let num_quads = (*self.next_quad.borrow()).min(self.capacity);
         (num_quads * VERTICES_PER_CELL, num_quads * INDICES_PER_CELL)
     }
 

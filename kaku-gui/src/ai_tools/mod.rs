@@ -132,9 +132,11 @@ pub fn execute(
             let pattern = args["pattern"].as_str().context("missing pattern")?;
             let search_path = paths::optional_path_arg(args, cwd);
             paths::resolve_checked_path(search_path, cwd)?;
-            let context_lines = args["context_lines"].as_u64().unwrap_or(2) as usize;
+            // Clamp model-supplied sizes: unbounded values would make ripgrep
+            // (or the in-process fallback) materialize entire trees as output.
+            let context_lines = args["context_lines"].as_u64().unwrap_or(2).min(100) as usize;
             let case_insensitive = args["case_insensitive"].as_bool().unwrap_or(false);
-            let max_results = args["max_results"].as_u64().unwrap_or(100) as usize;
+            let max_results = args["max_results"].as_u64().unwrap_or(100).min(1000) as usize;
             let glob_filter = args["glob"].as_str();
             search::exec_grep_search(
                 pattern,
@@ -178,7 +180,7 @@ pub fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai_client::AssistantConfig;
+    use crate::ai_client::{ApiMode, AssistantConfig};
 
     fn no_cancel() -> Arc<AtomicBool> {
         Arc::new(AtomicBool::new(false))
@@ -192,8 +194,10 @@ mod tests {
             base_url: "https://example.com".to_string(),
             custom_headers: vec![],
             provider: "Custom".to_string(),
+            api_mode: ApiMode::ChatCompletions,
             auth_type: "api_key".to_string(),
             chat_tools_enabled: false,
+            native_web_search: false,
             web_search_provider: None,
             web_search_api_key: None,
             web_fetch_script: None,
@@ -469,6 +473,67 @@ mod tests {
             "symbol_search should find greet: {}",
             sym
         );
+    }
+
+    #[test]
+    fn recursive_search_excludes_sensitive_descendants() {
+        let fixture = tempfile::tempdir().expect("tempdir");
+        std::fs::write(fixture.path().join("visible.txt"), "needle public\n").unwrap();
+        std::fs::write(fixture.path().join("visible.rs"), "fn shared_symbol() {}\n").unwrap();
+        std::fs::write(
+            fixture.path().join("Service-Credentials.txt"),
+            "needle credential-secret\n",
+        )
+        .unwrap();
+        std::fs::write(fixture.path().join(".NPMRC"), "needle package-token\n").unwrap();
+        std::fs::write(
+            fixture.path().join("Assistant.TOML"),
+            "needle assistant-token\n",
+        )
+        .unwrap();
+        let secrets = fixture.path().join("Secrets");
+        std::fs::create_dir(&secrets).unwrap();
+        std::fs::write(secrets.join("token.txt"), "needle directory-secret\n").unwrap();
+        std::fs::write(secrets.join("secret.rs"), "fn shared_symbol() {}\n").unwrap();
+
+        let mut cwd = fixture.path().to_string_lossy().into_owned();
+        let result = execute(
+            "grep_search",
+            &serde_json::json!({"pattern": "needle", "context_lines": 0}),
+            &mut cwd,
+            &dummy_config(),
+            &no_cancel(),
+        )
+        .unwrap();
+
+        assert!(result.contains("public"));
+        assert!(!result.contains("credential-secret"));
+        assert!(!result.contains("directory-secret"));
+        assert!(!result.contains("package-token"));
+        assert!(!result.contains("assistant-token"));
+
+        let direct = execute(
+            "fs_read",
+            &serde_json::json!({"path": ".NPMRC"}),
+            &mut cwd,
+            &dummy_config(),
+            &no_cancel(),
+        );
+        assert!(
+            direct.is_err(),
+            "direct reads must share recursive secret rules"
+        );
+
+        let symbols = execute(
+            "symbol_search",
+            &serde_json::json!({"query": "shared_symbol", "kind": "function"}),
+            &mut cwd,
+            &dummy_config(),
+            &no_cancel(),
+        )
+        .unwrap();
+        assert!(symbols.contains("visible.rs"));
+        assert!(!symbols.contains("secret.rs"));
     }
 
     #[test]

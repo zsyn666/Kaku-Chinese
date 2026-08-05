@@ -1385,12 +1385,7 @@ impl GlyphCache {
         overline: bool,
         metrics: &RenderMetrics,
     ) -> anyhow::Result<Sprite> {
-        let effective_underline = match (is_highlited_hyperlink, underline) {
-            (true, Underline::None) => Underline::Single,
-            (true, Underline::Single) => Underline::Double,
-            (true, _) => Underline::Single,
-            (false, u) => u,
-        };
+        let effective_underline = resolve_hyperlink_underline(is_highlited_hyperlink, underline);
 
         let key = LineKey {
             strike_through: is_strike_through,
@@ -1404,5 +1399,51 @@ impl GlyphCache {
         }
 
         self.line_sprite(key, metrics)
+    }
+}
+
+fn resolve_hyperlink_underline(is_highlighted: bool, underline: Underline) -> Underline {
+    if is_highlighted && underline == Underline::None {
+        Underline::Single
+    } else {
+        underline
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_hyperlink_underline;
+    use wezterm_term::Underline;
+
+    #[test]
+    fn hyperlink_hover_only_adds_an_underline_when_missing() {
+        assert_eq!(
+            resolve_hyperlink_underline(true, Underline::None),
+            Underline::Single
+        );
+
+        for underline in [
+            Underline::Single,
+            Underline::Double,
+            Underline::Curly,
+            Underline::Dashed,
+            Underline::Dotted,
+        ] {
+            assert_eq!(resolve_hyperlink_underline(true, underline), underline);
+        }
+    }
+
+    #[test]
+    fn non_hovered_text_keeps_its_underline() {
+        for underline in [
+            Underline::None,
+            Underline::Single,
+            Underline::Double,
+            Underline::Curly,
+            Underline::Dashed,
+            Underline::Dotted,
+        ] {
+            assert_eq!(resolve_hyperlink_underline(false, underline), underline);
+        }
     }
 }

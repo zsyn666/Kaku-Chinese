@@ -106,7 +106,9 @@ pub fn default_assistant_toml_template() -> String {
 # auto_fix_ignored_exit_codes: optional exit codes that should not trigger\n\
 #                              automatic command-fix suggestions.\n\
 #                              example: [2]\n\
-# base_url: chat-completions API root URL.\n\
+# base_url: OpenAI-compatible API root URL.\n\
+# api_mode: \"chat_completions\" (default) or \"responses\".\n\
+# native_web_search: add the provider-hosted web_search tool in responses mode.\n\
 # custom_headers: optional extra HTTP headers for enterprise proxies or API gateways.\n\
 #                 format: [\"Header-Name: value\", \"Another-Header: value\"]\n\
 #                 note: Authorization and Content-Type are reserved and cannot be overridden.\n\
@@ -117,10 +119,13 @@ model = \"{DEFAULT_MODEL}\"\n\
 chat_model = \"{DEFAULT_CHAT_MODEL}\"\n\
 # auto_fix_ignored_exit_codes = []\n\
 base_url = \"{DEFAULT_BASE_URL}\"\n\
+# api_mode = \"responses\"\n\
+# native_web_search = true\n\
 # custom_headers = [\"X-Customer-ID: your-customer-id\"]\n\
 # web_search_provider: optional web search backend for the chat agent.\n\
-#   \"none\" (default) disables the web_search and read_url tools.\n\
+#   \"none\" (default) disables the third-party web_search tool.\n\
 #   \"brave\" | \"pipellm\" | \"tavily\" enables both. Requires web_search_api_key.\n\
+#   Responses native_web_search does not require either third-party setting.\n\
 #   Configure via `kaku ai` instead of editing this file directly.\n\
 #   Capabilities used per provider:\n\
 #     brave:   web/news search, extra_snippets, freshness filter\n\

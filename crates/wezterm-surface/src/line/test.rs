@@ -145,6 +145,55 @@ fn apply_hyperlink_rules_wrapped_lines() {
 }
 
 #[test]
+fn apply_hyperlink_rules_does_not_join_hard_newline_rows() {
+    // Adjacent rows without a wrap attribute may belong to different commands.
+    // Scanning them as one string can manufacture a destination the terminal
+    // never emitted.
+    let url_part1 = "https://accounts.example.com/o";
+    let url_part2 = "/oauth2?code=abc123&state=xyz";
+    let indent = "  ";
+
+    let rules = vec![Rule::new(r"\b\w+://\S+[_/a-zA-Z0-9-]", "$0").unwrap()];
+
+    let mut line1: Line = url_part1.into();
+    let mut line2: Line = format!("{indent}{url_part2}").as_str().into();
+
+    let mut lines: [&mut Line; 2] = [&mut line1, &mut line2];
+    Line::apply_hyperlink_rules(&rules, &mut lines);
+
+    let fabricated = Arc::new(Hyperlink::new_implicit(&format!(
+        "{}{}",
+        url_part1, url_part2
+    )));
+
+    assert_ne!(
+        line1.get_cell(0).unwrap().attrs().hyperlink().cloned(),
+        Some(fabricated.clone()),
+        "first row must not point at a cross-row URL"
+    );
+    assert_eq!(
+        line2.get_cell(0).unwrap().attrs().hyperlink().cloned(),
+        None,
+        "indent cell stays unlinked"
+    );
+    assert_ne!(
+        line2
+            .get_cell(indent.len())
+            .unwrap()
+            .attrs()
+            .hyperlink()
+            .cloned(),
+        Some(fabricated),
+        "continuation must not point at a cross-row URL"
+    );
+    assert_eq!(
+        line2.len(),
+        indent.len() + url_part2.len(),
+        "hard-newline scan preserves the original row"
+    );
+}
+
+#[test]
 fn double_click_range_bounds() {
     let line: Line = "hello".into();
     let r = line.compute_double_click_range(200, |_| true);

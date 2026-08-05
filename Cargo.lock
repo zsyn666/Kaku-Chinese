@@ -2921,7 +2921,7 @@ dependencies = [
 
 [[package]]
 name = "kaku"
-version = "0.14.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2956,6 +2956,7 @@ dependencies = [
  "termwiz",
  "termwiz-funcs",
  "toml 0.8.23",
+ "toml_edit 0.22.27",
  "umask",
  "url",
  "wezterm-client",
@@ -2971,7 +2972,7 @@ version = "0.1.0"
 
 [[package]]
 name = "kaku-gui"
-version = "0.14.0"
+version = "0.17.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2998,8 +2999,11 @@ dependencies = [
  "finl_unicode",
  "frecency",
  "futures",
+ "getrandom 0.3.4",
  "hdrhistogram",
+ "hostname",
  "http_req",
+ "ignore",
  "image",
  "k9",
  "kaku-ai-utils",
@@ -3022,6 +3026,7 @@ dependencies = [
  "promise",
  "rangeset",
  "rayon",
+ "regex",
  "reqwest",
  "rust-i18n",
  "rustyline",

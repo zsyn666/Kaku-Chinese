@@ -34,10 +34,34 @@ const SUMMARIZE_PROMPT: &str = include_str!("../../../assets/prompts/summarize.t
 const SUMMARY_PREFIX: &str = "Previous conversation summary";
 
 fn role_of(msg: &ApiMessage) -> &str {
+    if let Some(item) = msg.0.get("kaku_responses_output_item") {
+        return if item["type"] == "function_call_output" {
+            "tool"
+        } else {
+            "assistant"
+        };
+    }
     msg.0.get("role").and_then(|v| v.as_str()).unwrap_or("user")
 }
 
 fn content_of(msg: &ApiMessage) -> String {
+    if let Some(item) = msg.0.get("kaku_responses_output_item") {
+        return match item["type"].as_str() {
+            Some("message") => item["content"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|part| part["text"].as_str().or_else(|| part["refusal"].as_str()))
+                .collect::<Vec<_>>()
+                .join(""),
+            Some("function_call") => format!(
+                "[tool_call: {}]",
+                item["name"].as_str().unwrap_or("unknown")
+            ),
+            Some("function_call_output") => item["output"].as_str().unwrap_or("").to_string(),
+            _ => String::new(),
+        };
+    }
     if let Some(s) = msg.0.get("content").and_then(|v| v.as_str()) {
         return s.to_string();
     }
@@ -71,6 +95,10 @@ fn serialize_transcript(msgs: &[ApiMessage]) -> String {
 
 fn has_tool_calls(msg: &ApiMessage) -> bool {
     msg.0.get("tool_calls").and_then(|v| v.as_array()).is_some()
+}
+
+fn is_responses_output_item(msg: &ApiMessage) -> bool {
+    msg.0.get("kaku_responses_output_item").is_some()
 }
 
 fn is_tool_result(msg: &ApiMessage) -> bool {
@@ -111,7 +139,9 @@ fn summary_split_index(messages: &[ApiMessage]) -> Option<usize> {
     // in the whole conversation. Anchoring on the first tool use previously
     // dragged the split to the start and disabled folding entirely whenever
     // tools ran early in the session.
-    if split > PREFIX_KEEP && has_tool_calls(&messages[split]) {
+    if split > PREFIX_KEEP
+        && (has_tool_calls(&messages[split]) || is_responses_output_item(&messages[split]))
+    {
         split = active_tool_sequence_start(messages, split);
     }
 
@@ -222,6 +252,36 @@ mod tests {
             tool_calls(),
             ApiMessage::tool_result("call_1", "fs_read", "content"),
             ApiMessage::tool_result("call_2", "grep_search", "matches"),
+            ApiMessage::assistant("after tools"),
+            ApiMessage::user("follow up"),
+            ApiMessage::assistant("answer"),
+            ApiMessage::user("tail"),
+        ];
+
+        assert_eq!(summary_split_index(&messages), Some(4));
+    }
+
+    #[test]
+    fn summary_split_does_not_cut_into_responses_tool_sequence() {
+        let messages = vec![
+            ApiMessage::system("system"),
+            ApiMessage::user("environment"),
+            ApiMessage::user("old user"),
+            ApiMessage::assistant("old assistant"),
+            ApiMessage::user("current user"),
+            ApiMessage::responses_output_item(serde_json::json!({
+                "id": "reasoning_1",
+                "type": "reasoning",
+                "encrypted_content": "opaque"
+            })),
+            ApiMessage::responses_output_item(serde_json::json!({
+                "id": "fc_1",
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "fs_read",
+                "arguments": "{}"
+            })),
+            ApiMessage::tool_result("call_1", "fs_read", "content"),
             ApiMessage::assistant("after tools"),
             ApiMessage::user("follow up"),
             ApiMessage::assistant("answer"),

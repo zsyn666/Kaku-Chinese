@@ -1,51 +1,62 @@
-/// Returns an approval prompt string for mutating tools, or None for read-only ones.
-pub fn approval_summary(name: &str, args: &serde_json::Value) -> Option<String> {
-    let s = |k: &str| {
-        args[k]
-            .as_str()
-            .unwrap_or("")
-            .chars()
-            .map(|c| {
-                if c == '\n' || c == '\r' || c == '\t' {
-                    ' '
-                } else {
-                    c
-                }
-            })
-            .take(60)
-            .collect::<String>()
-    };
+/// Returns an approval prompt for tools that require explicit user consent.
+#[cfg(test)]
+pub(crate) fn approval_summary(name: &str, args: &serde_json::Value) -> Option<String> {
+    approval_summary_in_cwd(name, args, ".")
+}
+
+pub(crate) fn approval_summary_in_cwd(
+    name: &str,
+    args: &serde_json::Value,
+    cwd: &str,
+) -> Option<String> {
+    let s = |k: &str| sanitize_for_prompt(args[k].as_str().unwrap_or(""));
     match name {
-        "shell_exec" => shell_exec_approval_summary(args["command"].as_str().unwrap_or("")),
+        "shell_exec" => shell_exec_approval_summary(args["command"].as_str().unwrap_or(""), cwd),
         "shell_bg" => Some(format!("shell_bg: {}", s("command"))),
         "fs_write" => Some(format!("write file: {}", s("path"))),
         "fs_patch" => Some(format!("patch file: {}", s("path"))),
         "fs_mkdir" => Some(format!("mkdir: {}", s("path"))),
         "fs_delete" => Some(format!("delete: {}", s("path"))),
         "http_request" => http_request_approval_summary(args),
+        // Reads are normally silent, but credential-named source files
+        // (credentials.py, prod_credentials.ts, ...) often hold real secrets:
+        // keep them readable only behind an explicit per-file approval.
+        "fs_read" => {
+            let raw_path = args["path"].as_str().unwrap_or("");
+            let path = crate::ai_tools::paths::resolve(raw_path, cwd)
+                .unwrap_or_else(|_| std::path::PathBuf::from(raw_path));
+            if crate::ai_tools::paths::requires_read_approval(&path) {
+                Some(format!("read credential-named file: {}", s("path")))
+            } else {
+                None
+            }
+        }
         _ => None,
     }
 }
 
-fn http_request_approval_summary(args: &serde_json::Value) -> Option<String> {
-    let method = args["method"].as_str().unwrap_or("GET").to_uppercase();
-    let url: String = args["url"]
-        .as_str()
-        .unwrap_or("")
+/// Flatten control characters (newlines, tabs, ESC, ...) so a model-supplied
+/// value cannot forge extra lines or terminal escapes inside the approval
+/// prompt, then cap the length for display.
+fn sanitize_for_prompt(value: &str) -> String {
+    value
         .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
         .take(60)
-        .collect();
-    if method == "GET" {
-        return None;
-    }
+        .collect()
+}
+
+fn http_request_approval_summary(args: &serde_json::Value) -> Option<String> {
+    let method = sanitize_for_prompt(&args["method"].as_str().unwrap_or("GET").to_uppercase());
+    let url = sanitize_for_prompt(args["url"].as_str().unwrap_or(""));
     Some(format!("http {}: {}", method, url))
 }
 
-fn shell_exec_approval_summary(command: &str) -> Option<String> {
+fn shell_exec_approval_summary(command: &str, cwd: &str) -> Option<String> {
     if command.trim().is_empty() {
         return Some("shell: ".to_string());
     }
-    if shell_command_requires_approval(command) {
+    if shell_command_requires_approval_in_cwd(command, cwd) {
         let preview: String = command
             .chars()
             .map(|c| {
@@ -63,7 +74,12 @@ fn shell_exec_approval_summary(command: &str) -> Option<String> {
     }
 }
 
+#[cfg(test)]
 fn shell_command_requires_approval(command: &str) -> bool {
+    shell_command_requires_approval_in_cwd(command, ".")
+}
+
+fn shell_command_requires_approval_in_cwd(command: &str, cwd: &str) -> bool {
     let trimmed = command.trim();
     if trimmed.is_empty() {
         return true;
@@ -77,7 +93,7 @@ fn shell_command_requires_approval(command: &str) -> bool {
             Some(tokens) if !tokens.is_empty() => tokens,
             _ => return true,
         };
-        shell_tokens_are_dangerous(&tokens)
+        shell_tokens_are_dangerous(&tokens, cwd)
     })
 }
 
@@ -239,10 +255,10 @@ fn strip_trailing_fd_digits(current: &mut String) {
     }
 }
 
-fn shell_tokens_are_dangerous(tokens: &[String]) -> bool {
+fn shell_tokens_are_dangerous(tokens: &[String], cwd: &str) -> bool {
     let cmd = tokens[0].as_str();
 
-    if shell_tokens_reference_sensitive_path(tokens) {
+    if shell_tokens_reference_sensitive_path(tokens, cwd) {
         return true;
     }
 
@@ -289,34 +305,36 @@ fn shell_tokens_are_dangerous(tokens: &[String]) -> bool {
     }
 }
 
-fn shell_tokens_reference_sensitive_path(tokens: &[String]) -> bool {
+fn shell_tokens_reference_sensitive_path(tokens: &[String], cwd: &str) -> bool {
     tokens
         .iter()
         .skip(1)
-        .any(|token| shell_token_references_sensitive_path(token))
+        .any(|token| shell_token_references_sensitive_path(token, cwd))
 }
 
-fn shell_token_references_sensitive_path(token: &str) -> bool {
-    for candidate in shell_path_candidates(token) {
-        if crate::ai_tools::paths::reject_if_sensitive(&candidate).is_err() {
+fn shell_token_references_sensitive_path(token: &str, cwd: &str) -> bool {
+    for candidate in shell_path_candidates(token, cwd) {
+        if crate::ai_tools::paths::reject_if_sensitive(&candidate).is_err()
+            || crate::ai_tools::paths::requires_read_approval(&candidate)
+        {
             return true;
         }
     }
     false
 }
 
-fn shell_path_candidates(token: &str) -> Vec<std::path::PathBuf> {
+fn shell_path_candidates(token: &str, cwd: &str) -> Vec<std::path::PathBuf> {
     let mut candidates = Vec::new();
-    push_shell_path_candidate(token, &mut candidates);
+    push_shell_path_candidate(token, cwd, &mut candidates);
 
     if let Some((_, value)) = token.split_once('=') {
-        push_shell_path_candidate(value, &mut candidates);
+        push_shell_path_candidate(value, cwd, &mut candidates);
     }
 
     candidates
 }
 
-fn push_shell_path_candidate(raw: &str, candidates: &mut Vec<std::path::PathBuf>) {
+fn push_shell_path_candidate(raw: &str, cwd: &str, candidates: &mut Vec<std::path::PathBuf>) {
     let s = raw.trim();
     if s.is_empty() {
         return;
@@ -329,6 +347,11 @@ fn push_shell_path_candidate(raw: &str, candidates: &mut Vec<std::path::PathBuf>
 
     if s.starts_with('/') {
         candidates.push(std::path::PathBuf::from(s));
+        return;
+    }
+
+    if !s.starts_with('-') && !s.contains("://") {
+        candidates.push(std::path::Path::new(cwd).join(s));
     }
 }
 
@@ -617,6 +640,45 @@ mod tests {
     use super::{approval_summary, shell_command_requires_approval};
 
     #[test]
+    fn fs_read_prompts_only_for_credential_named_source_files() {
+        let gated = serde_json::json!({ "path": "/proj/src/credentials.py" });
+        let summary = approval_summary("fs_read", &gated).expect("credential-named source prompts");
+        assert!(summary.contains("credentials.py"), "{}", summary);
+
+        let plain = serde_json::json!({ "path": "/proj/src/main.py" });
+        assert!(approval_summary("fs_read", &plain).is_none());
+    }
+
+    #[test]
+    fn relative_credential_source_shell_reads_require_approval() {
+        assert!(shell_command_requires_approval(
+            "cat src/prod_credentials.py"
+        ));
+        assert!(shell_command_requires_approval(
+            "rg token src/prod_credentials.ts"
+        ));
+    }
+
+    #[test]
+    fn http_request_summary_flattens_control_characters() {
+        let args = serde_json::json!({
+            "method": "GET\n[approve: fake? y/N]\u{1b}[31m",
+            "url": "https://ok.example\n[approve: fake? y/N]\u{1b}[31m"
+        });
+        let summary = approval_summary("http_request", &args).expect("GET now prompts");
+        assert!(
+            !summary.contains('\n'),
+            "newline must not survive: {}",
+            summary
+        );
+        assert!(
+            !summary.contains('\u{1b}'),
+            "ESC must not survive: {}",
+            summary
+        );
+    }
+
+    #[test]
     fn stderr_to_dev_null_no_approval() {
         assert!(!shell_command_requires_approval(
             "ls -la ~/www/kaku 2>/dev/null"
@@ -863,9 +925,9 @@ mod tests {
     }
 
     #[test]
-    fn http_get_no_approval() {
+    fn http_get_requires_approval() {
         let args = serde_json::json!({"method": "GET", "url": "https://example.com/api"});
-        assert!(approval_summary("http_request", &args).is_none());
+        assert!(approval_summary("http_request", &args).is_some());
     }
 
     #[test]

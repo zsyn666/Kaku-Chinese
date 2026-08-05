@@ -1,22 +1,37 @@
 use crate::quad::TripleLayerQuadAllocator;
 use crate::utilsprites::RenderMetrics;
 use ::window::ULength;
-use config::{ConfigHandle, DimensionContext, TabBarColors};
+use config::{Config, ConfigHandle, Dimension, DimensionContext, TabBarColors};
 use window::color::LinearRgba;
 
-const INTEGRATED_BUTTONS_TOP_INSET: usize = 16;
+const INTEGRATED_BUTTONS_TOP_TAB_INSET_POINTS: f32 = 3.0;
+const INTEGRATED_BUTTONS_TOP_CLEARANCE_POINTS: f32 = 16.0;
+
+fn integrated_buttons_top_inset_pixels(dpi: f32, top_tab_bar_visible: bool) -> usize {
+    let points = if top_tab_bar_visible {
+        INTEGRATED_BUTTONS_TOP_TAB_INSET_POINTS
+    } else {
+        INTEGRATED_BUTTONS_TOP_CLEARANCE_POINTS
+    };
+    Dimension::Points(points).evaluate_as_pixels(DimensionContext {
+        dpi,
+        pixel_max: 0.0,
+        pixel_cell: 0.0,
+    }) as usize
+}
 
 pub(crate) fn integrated_buttons_top_inset(
-    config: &ConfigHandle,
+    config: &Config,
     is_fullscreen: bool,
-    _top_tab_bar_visible: bool,
+    top_tab_bar_visible: bool,
+    dpi: f32,
 ) -> usize {
     if !is_fullscreen
         && config
             .window_decorations
             .contains(::window::WindowDecorations::INTEGRATED_BUTTONS)
     {
-        INTEGRATED_BUTTONS_TOP_INSET
+        integrated_buttons_top_inset_pixels(dpi, top_tab_bar_visible)
     } else {
         0
     }
@@ -61,9 +76,13 @@ impl crate::TermWindow {
             let height = self.dimensions.pixel_height as f32;
             let width = self.dimensions.pixel_width as f32;
             let top_tab_bar_visible = self.show_tab_bar && !self.config.tab_bar_at_bottom;
-            let integrated_top_inset =
-                integrated_buttons_top_inset(&self.config, is_fullscreen, top_tab_bar_visible)
-                    .min(border_dimensions.top.get()) as f32;
+            let integrated_top_inset = integrated_buttons_top_inset(
+                &self.config,
+                is_fullscreen,
+                top_tab_bar_visible,
+                self.dimensions.dpi as f32,
+            )
+            .min(border_dimensions.top.get()) as f32;
 
             // In fullscreen, use palette background color for all borders.
             // In windowed mode, use configured border colors if available.
@@ -283,6 +302,7 @@ impl crate::TermWindow {
             &self.config,
             is_fullscreen,
             self.show_tab_bar && !self.config.tab_bar_at_bottom,
+            self.dimensions.dpi as f32,
         );
         if extra_top > 0 {
             border.top += ULength::new(extra_top);
@@ -295,6 +315,47 @@ impl crate::TermWindow {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integrated_buttons_top_inset_is_state_sensitive() {
+        let mut config = Config::default_config();
+        config.window_decorations =
+            ::window::WindowDecorations::INTEGRATED_BUTTONS | ::window::WindowDecorations::RESIZE;
+
+        assert_eq!(integrated_buttons_top_inset(&config, false, true, 144.0), 6);
+        assert_eq!(
+            integrated_buttons_top_inset(&config, false, false, 144.0),
+            32
+        );
+        assert_eq!(integrated_buttons_top_inset(&config, true, true, 144.0), 0);
+
+        config.window_decorations =
+            ::window::WindowDecorations::TITLE | ::window::WindowDecorations::RESIZE;
+        assert_eq!(integrated_buttons_top_inset(&config, false, true, 144.0), 0);
+    }
+
+    #[test]
+    fn integrated_buttons_top_inset_scales_with_dpi() {
+        assert_eq!(integrated_buttons_top_inset_pixels(72.0, true), 3);
+        assert_eq!(integrated_buttons_top_inset_pixels(144.0, true), 6);
+        assert_eq!(integrated_buttons_top_inset_pixels(72.0, false), 16);
+        assert_eq!(integrated_buttons_top_inset_pixels(110.0, false), 24);
+        assert_eq!(integrated_buttons_top_inset_pixels(144.0, false), 32);
+    }
+
+    /// The bundled padding is expressed in device pixels on purpose. Switching
+    /// it to points doubles the gutter on a 2x display, which is the display
+    /// the spacing was tuned on.
+    #[test]
+    fn bundled_padding_stays_in_device_pixels() {
+        let bundled_config =
+            include_str!("../../../../assets/macos/Kaku.app/Contents/Resources/kaku.lua");
+
+        assert!(bundled_config
+            .contains("return { left = '26px', right = '26px', top = '26px', bottom = '0px' }"));
+        assert!(bundled_config
+            .contains("return { left = '40px', right = '40px', top = '40px', bottom = '0px' }"));
+    }
 
     #[test]
     fn opaque_non_fancy_top_tab_inset_matches_tab_bar_background() {

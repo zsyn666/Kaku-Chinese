@@ -40,6 +40,8 @@ Run diagnostics and verify that Kaku's shell integration, PATH entries, and opti
 
 ```bash
 kaku doctor
+kaku doctor --shell fish       # check fish even when $SHELL points to zsh
+kaku doctor --shell fish --fix # repair the selected integration
 ```
 
 ## kaku update
@@ -59,14 +61,20 @@ User-authored Lua outside managed blocks is preserved. Use with caution and run
 
 ```bash
 kaku reset
+kaku reset --shell fish # use fish for restart and restore guidance
 ```
 
 ## kaku init
 
-Set up Kaku's shell integration for zsh and/or fish. Creates `~/.config/kaku/zsh/kaku.zsh` and optionally `~/.config/kaku/fish/kaku.fish`. Also installs optional CLI tools (Starship, Delta, Lazygit, Yazi) via Homebrew.
+Set up Kaku's shell integration for zsh or fish. When both shells are installed,
+an interactive run asks which one to configure. Use `--shell` to make the choice
+explicit in scripts or when `$SHELL` does not match your daily shell. Also
+installs optional CLI tools (Starship, Delta, Lazygit, Yazi) via Homebrew.
 
 ```bash
 kaku init
+kaku init --shell fish
+kaku init --shell zsh --update-only
 ```
 
 If the `kaku` command goes missing from your shell, restore it with:

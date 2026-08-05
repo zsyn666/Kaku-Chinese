@@ -124,7 +124,7 @@ read_config_version() {
 	fi
 
 	local version
-	version="$(sed -nE 's/.*"config_version"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$STATE_FILE" | head -n 1)"
+	version="$(/usr/bin/plutil -extract config_version raw -expect integer -o - -- "$STATE_FILE" 2>/dev/null || true)"
 	if [[ "$version" =~ ^[0-9]+$ ]]; then
 		printf '%s\n' "$version"
 	else
@@ -132,14 +132,109 @@ read_config_version() {
 	fi
 }
 
+read_managed_shell() {
+	if [[ ! -f "$STATE_FILE" ]]; then
+		return
+	fi
+
+	local managed_shell
+	managed_shell="$(/usr/bin/plutil -extract managed_shell raw -expect string -o - -- "$STATE_FILE" 2>/dev/null || true)"
+	case "$managed_shell" in
+		zsh|fish) printf '%s\n' "$managed_shell" ;;
+	esac
+}
+
+mirror_completed_state_to_default() {
+	local target_version="$1"
+	local managed_shell="${2:-}"
+	local default_config_dir="${HOME:-}/.config/kaku"
+	local default_state_file="$default_config_dir/state.json"
+
+	if [[ -z "${HOME:-}" || "$CONFIG_DIR" == "$default_config_dir" ]]; then
+		return
+	fi
+
+	mkdir -p "$default_config_dir"
+	local mirror_tmp
+	mirror_tmp="${default_state_file}.tmp.$$"
+	if [[ -f "$default_state_file" ]] &&
+		/usr/bin/plutil -convert json -o "$mirror_tmp" -- "$default_state_file" 2>/dev/null; then
+		:
+	else
+		printf '{"config_version":%s}\n' "$target_version" >"$mirror_tmp"
+	fi
+
+	if ! /usr/bin/plutil -replace config_version -integer "$target_version" "$mirror_tmp" 2>/dev/null; then
+		if ! /usr/bin/plutil -insert config_version -integer "$target_version" "$mirror_tmp" 2>/dev/null; then
+			if [[ "$(tr -d '[:space:]' <"$mirror_tmp")" == "{}" ]]; then
+				printf '{"config_version":%s}\n' "$target_version" >"$mirror_tmp"
+			else
+				rm -f "$mirror_tmp"
+				return 1
+			fi
+		fi
+	fi
+	if [[ "$managed_shell" == "zsh" || "$managed_shell" == "fish" ]]; then
+		if ! /usr/bin/plutil -replace managed_shell -string "$managed_shell" "$mirror_tmp" 2>/dev/null; then
+			/usr/bin/plutil -insert managed_shell -string "$managed_shell" "$mirror_tmp" 2>/dev/null || {
+				rm -f "$mirror_tmp"
+				return 1
+			}
+		fi
+	fi
+	/usr/bin/plutil -convert json -r "$mirror_tmp" >/dev/null
+	mv "$mirror_tmp" "$default_state_file"
+}
+
+record_config_version_success() {
+	local target_version="$1"
+	printf '%s\n' "$target_version" >"$LEGACY_VERSION_FILE"
+	if ! mirror_completed_state_to_default "$target_version" "$(read_managed_shell || true)"; then
+		printf 'warning: could not mirror completed Kaku state to the default config path\n' >&2
+	fi
+	return 0
+}
+
 persist_config_version() {
 	local target_version="${1:-$CURRENT_CONFIG_VERSION}"
 	mkdir -p "$CONFIG_DIR"
+	if [[ ! "$target_version" =~ ^[0-9]+$ ]]; then
+		printf 'invalid config version: %s\n' "$target_version" >&2
+		return 1
+	fi
 
-	local width height geometry_json
+	# Treat state as structured JSON. Text regexes can accidentally update a
+	# nested config_version or discard fields when whitespace precedes `{`.
+	# plutil ships with macOS and preserves every unknown object member while
+	# replacing or inserting the top-level version.
+	if [[ -f "$STATE_FILE" && ! -f "$LEGACY_GEOMETRY_FILE" ]]; then
+		local state_tmp
+		state_tmp="${STATE_FILE}.tmp.$$"
+		if /usr/bin/plutil -convert json -o "$state_tmp" -- "$STATE_FILE" 2>/dev/null; then
+			if ! /usr/bin/plutil -replace config_version -integer "$target_version" "$state_tmp" 2>/dev/null; then
+				if ! /usr/bin/plutil -insert config_version -integer "$target_version" "$state_tmp" 2>/dev/null; then
+					if [[ "$(tr -d '[:space:]' <"$state_tmp")" == "{}" ]]; then
+						printf '{"config_version":%s}\n' "$target_version" >"$state_tmp"
+					else
+						rm -f "$state_tmp"
+						return 1
+					fi
+				fi
+			fi
+			/usr/bin/plutil -convert json -r "$state_tmp" >/dev/null
+			mv "$state_tmp" "$STATE_FILE"
+			record_config_version_success "$target_version"
+			return
+		fi
+		rm -f "$state_tmp"
+	fi
+
+	local width height geometry_json managed_shell managed_shell_json
 	width=""
 	height=""
 	geometry_json=""
+	managed_shell="$(read_managed_shell || true)"
+	managed_shell_json=""
 
 	if [[ -f "$STATE_FILE" ]]; then
 		width="$(sed -nE 's/.*"width"[[:space:]]*:[[:space:]]*([0-9]+).*/\1/p' "$STATE_FILE" | head -n 1)"
@@ -163,12 +258,15 @@ persist_config_version() {
 	if [[ -n "$width" && -n "$height" ]]; then
 		geometry_json="$(printf ',\n  "window_geometry": {\n    "width": %s,\n    "height": %s\n  }' "$width" "$height")"
 	fi
+	if [[ "$managed_shell" == "zsh" || "$managed_shell" == "fish" ]]; then
+		managed_shell_json="$(printf ',\n  "managed_shell": "%s"' "$managed_shell")"
+	fi
 
-	printf "{\n  \"config_version\": %s%s\n}\n" "$target_version" "$geometry_json" >"$STATE_FILE"
+	printf "{\n  \"config_version\": %s%s%s\n}\n" "$target_version" "$managed_shell_json" "$geometry_json" >"$STATE_FILE"
 
 	# Keep a legacy version marker for users still loading older bundled kaku.lua.
 	# This avoids repeated first-run onboarding after upgrades.
-	printf '%s\n' "$target_version" >"$LEGACY_VERSION_FILE"
+	record_config_version_success "$target_version"
 	rm -f "$LEGACY_GEOMETRY_FILE"
 }
 

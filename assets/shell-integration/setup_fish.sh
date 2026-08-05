@@ -28,7 +28,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Thin entrypoint: delegate to `kaku init` whenever possible.
 if [[ "${KAKU_INIT_INTERNAL:-0}" != "1" ]]; then
 	if [[ -n "${KAKU_BIN:-}" && -x "${KAKU_BIN}" ]]; then
-		exec "${KAKU_BIN}" init "$@"
+		exec "${KAKU_BIN}" init --shell fish "$@"
 	fi
 
 	for candidate in \
@@ -36,7 +36,7 @@ if [[ "${KAKU_INIT_INTERNAL:-0}" != "1" ]]; then
 		"/Applications/Kaku.app/Contents/MacOS/kaku" \
 		"$HOME/Applications/Kaku.app/Contents/MacOS/kaku"; do
 		if [[ -x "$candidate" ]]; then
-			exec "$candidate" init "$@"
+			exec "$candidate" init --shell fish "$@"
 		fi
 	done
 fi
@@ -741,7 +741,7 @@ cat <<'EOF' >"$KAKU_INIT_FILE"
 fish_add_path "$HOME/.config/kaku/fish/bin"
 
 # === Starship prompt ===
-if command -q starship
+if set -q TERM_PROGRAM; and test "$TERM_PROGRAM" = "Kaku"; and command -q starship
     starship init fish | source
 end
 
@@ -752,13 +752,40 @@ end
 
 # === SSH TERM fix ===
 # Auto-set TERM to xterm-256color for SSH connections since remote hosts
-# typically lack the kaku terminfo entry.
+# typically lack the kaku terminfo entry. Also add IdentitiesOnly=yes when
+# the 1Password SSH agent is active, matching the zsh integration; set
+# KAKU_SSH_SKIP_1PASSWORD_FIX=1 to disable. Guard: keep a user-defined ssh
+# function untouched.
+if not functions -q ssh
 function ssh
-    if test "$TERM" = kaku; and not set -q KAKU_SSH_SKIP_TERM_FIX
-        TERM=xterm-256color command ssh $argv
-    else
-        command ssh $argv
+    set -l _kaku_extra
+    if not set -q KAKU_SSH_SKIP_1PASSWORD_FIX
+        switch "$SSH_AUTH_SOCK"
+            case '*1password*' '*2BUA8C4S2C*'
+                if not string match -q -- '*IdentitiesOnly=*' $argv
+                    set _kaku_extra -oIdentitiesOnly=yes
+                end
+        end
     end
+    if test "$TERM" = kaku; and not set -q KAKU_SSH_SKIP_TERM_FIX
+        TERM=xterm-256color command ssh $_kaku_extra $argv
+    else
+        command ssh $_kaku_extra $argv
+    end
+end
+end
+
+# === mosh TERM fix ===
+# mosh-server inherits TERM on the remote side, so mosh needs the same
+# terminfo fallback as ssh.
+if command -q mosh; and not functions -q mosh
+function mosh
+    if test "$TERM" = kaku; and not set -q KAKU_SSH_SKIP_TERM_FIX
+        TERM=xterm-256color command mosh $argv
+    else
+        command mosh $argv
+    end
+end
 end
 
 # === sudo TERM fix ===
@@ -786,15 +813,17 @@ end
 
 # === OSC 1337: User variables (AI fix hooks) ===
 function __kaku_set_user_var
-    # Only emit when inside a Kaku/WezTerm pane
+    # Only emit when inside a Kaku/WezTerm pane.
+    # Guards return 1: a bare return inherits the guard's success status,
+    # which made callers believe the var was emitted (#511).
     if test "$TERM" != kaku; and not set -q WEZTERM_PANE
-        return
+        return 1
     end
     if set -q WEZTERM_SHELL_SKIP_USER_VARS; and test "$WEZTERM_SHELL_SKIP_USER_VARS" = 1
-        return
+        return 1
     end
     if not command -q base64
-        return
+        return 1
     end
     set -l encoded (printf '%s' $argv[2] | base64 | tr -d '\r\n')
     if set -q TMUX
@@ -804,12 +833,24 @@ function __kaku_set_user_var
     end
 end
 
+# Authenticate Kaku's privileged control messages so arbitrary PTY output
+# cannot trigger local AI requests or reuse the user's assistant credentials.
+function __kaku_set_ai_user_var
+    set -l capability_file "$HOME/.config/kaku/ai_inline_capability"
+    test -r "$capability_file"; or return 1
+    # read reports EOF as failure when the file lacks a trailing newline,
+    # but still fills the variable; accept that case (#511).
+    read -l capability < "$capability_file"; or test -n "$capability"; or return 1
+    test -n "$capability"; or return 1
+    __kaku_set_user_var $argv[1] "$capability:$argv[2]"
+end
+
 # Capture last command for AI suggestion (preexec fires before command runs)
 function __kaku_ai_preexec --on-event fish_preexec
     if set -q KAKU_AUTO_DISABLE
         return
     end
-    __kaku_set_user_var kaku_last_cmd $argv[1]
+    __kaku_set_ai_user_var kaku_last_cmd $argv[1]; or true
     set -g _kaku_ai_cmd_pending 1
 end
 
@@ -823,7 +864,7 @@ function __kaku_ai_precmd --on-event fish_prompt
     if not set -q _kaku_ai_cmd_pending; or test "$_kaku_ai_cmd_pending" != 1
         return
     end
-    __kaku_set_user_var kaku_last_exit_code $last_exit
+    __kaku_set_ai_user_var kaku_last_exit_code $last_exit; or true
     set -g _kaku_ai_cmd_pending 0
 end
 
@@ -865,14 +906,17 @@ function __kaku_ai_query_execute
             set -l query (string trim -- $body)
             if test -n "$query"
                 builtin history append -- $cmd
-                set -g __kaku_ai_waiting 1
-                set -g __kaku_ai_waiting_ts (date +%s)
-                __kaku_set_user_var kaku_ai_query "[mode:$mode] $query"
-                # Clear the submitted comment immediately so generated commands
-                # cannot append after the stale "# query" buffer.
-                commandline -r ""
-                commandline -f repaint
-                return
+                # Only flag the waiting state once the request was actually
+                # emitted, so a failed send never blocks Enter (#511).
+                if __kaku_set_ai_user_var kaku_ai_query "[mode:$mode] $query"
+                    set -g __kaku_ai_waiting 1
+                    set -g __kaku_ai_waiting_ts (date +%s)
+                    # Clear the submitted comment immediately so generated commands
+                    # cannot append after the stale "# query" buffer.
+                    commandline -r ""
+                    commandline -f repaint
+                    return
+                end
             end
         end
     end

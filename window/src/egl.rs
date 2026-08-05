@@ -483,15 +483,6 @@ impl GlState {
         bail!("with_egl_lib failed: {}", errors.join(", "))
     }
 
-    #[cfg(all(unix, not(target_os = "macos")))]
-    #[cfg(feature = "wayland")]
-    pub fn create_wayland(
-        display: Option<ffi::EGLNativeDisplayType>,
-        wegl_surface: &wayland_egl::WlEglSurface,
-    ) -> anyhow::Result<Self> {
-        Self::create(display, wegl_surface.ptr())
-    }
-
     pub fn create(
         display: Option<ffi::EGLNativeDisplayType>,
         window: ffi::EGLNativeWindowType,
@@ -532,15 +523,6 @@ impl GlState {
 
             Self::create_with_existing_connection(&connection, window)
         })
-    }
-
-    #[cfg(all(unix, not(target_os = "macos")))]
-    #[cfg(feature = "wayland")]
-    pub fn create_wayland_with_existing_connection(
-        connection: &Rc<GlConnection>,
-        wegl_surface: &wayland_egl::WlEglSurface,
-    ) -> anyhow::Result<Self> {
-        Self::create_with_existing_connection(connection, wegl_surface.ptr())
     }
 
     pub fn create_with_existing_connection(

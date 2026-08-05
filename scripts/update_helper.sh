@@ -46,6 +46,25 @@ rollback() {
   fi
 }
 
+read_persisted_managed_shell() {
+  local config_base state_file managed_shell
+  config_base="${XDG_CONFIG_HOME:-}"
+  if [[ -z "$config_base" ]]; then
+    if [[ -z "${HOME:-}" ]]; then
+      return
+    fi
+    config_base="$HOME/.config"
+  fi
+  state_file="$config_base/kaku/state.json"
+  if [[ ! -f "$state_file" ]]; then
+    return
+  fi
+  managed_shell="$(/usr/bin/plutil -extract managed_shell raw -expect string -o - -- "$state_file" 2>/dev/null || true)"
+  case "$managed_shell" in
+    zsh|fish) printf '%s\n' "$managed_shell" ;;
+  esac
+}
+
 install_kaku_wrapper_fallback() {
   local home_dir shell_candidate wrapper_shell wrapper_path wrapper_dir
   home_dir="${HOME:-}"
@@ -53,7 +72,13 @@ install_kaku_wrapper_fallback() {
     return 1
   fi
 
-  shell_candidate="${KAKU_TARGET_SHELL:-${SHELL:-/bin/zsh}}"
+  shell_candidate="${KAKU_TARGET_SHELL:-}"
+  if [[ -z "$shell_candidate" ]]; then
+    shell_candidate="$(read_persisted_managed_shell || true)"
+  fi
+  if [[ -z "$shell_candidate" ]]; then
+    shell_candidate="${SHELL:-/bin/zsh}"
+  fi
   case "$shell_candidate" in
     *fish|fish)
       wrapper_shell="fish"

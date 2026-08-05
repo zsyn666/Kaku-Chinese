@@ -153,6 +153,7 @@ hdrhistogram = "7.1"
 hex = {version="0.4", default-features=false}
 hostname = "0.4"
 http_req = "0.11"
+ignore = "0.4"
 human-sort = "0.2"
 humansize = "2.1"
 humantime = "2.1"
@@ -264,6 +265,7 @@ time-funcs = { path = "lua-api-crates/time-funcs" }
 tiny-skia = "0.11"
 tokio = "1.43"
 toml = "0.8"
+toml_edit = "0.22"
 ucd-trie = {version="0.1", default-features=false}
 uds_windows = "1.1"
 umask = { path = "crates/umask" }
@@ -276,11 +278,6 @@ uuid = "1.13"
 varbincode = "0.1"
 vtparse = { version="0.7", path="crates/vtparse", default-features=false }
 walkdir = "2"
-wayland-backend = "0.3.5"
-wayland-client = "0.31"
-wayland-egl = "0.32"
-wayland-protocols = "0.32"
-wayland-protocols-plasma = { version="0.3.6", features=["client"] }
 wezterm-bidi = { version="0.2.3", path = "crates/bidi", default-features=false}
 wezterm-blob-leases = { version="0.1.1", path = "crates/wezterm-blob-leases"}
 wezterm-cell = { path = "crates/wezterm-cell"}

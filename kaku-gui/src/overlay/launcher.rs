@@ -16,6 +16,7 @@ use config::keyassignment::{
 };
 use mux::domain::{DomainId, DomainState};
 use mux::pane::PaneId;
+use mux::tab::TabId;
 use mux::termwiztermtab::TermWizTerminal;
 use mux::Mux;
 use rayon::prelude::*;
@@ -38,12 +39,14 @@ struct Entry {
 pub struct LauncherTabEntry {
     pub title: String,
     pub pane_id: PaneId,
+    pub tab_id: TabId,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum LauncherAction {
     Assignment(KeyAssignment),
-    ActivatePane(PaneId),
+    ActivatePane { pane_id: PaneId, tab_id: TabId },
+    CloseNavigatorTab(TabId),
 }
 
 impl From<KeyAssignment> for LauncherAction {
@@ -171,6 +174,7 @@ struct LauncherState {
     alphabet: String,
     selection: String,
     always_fuzzy: bool,
+    allow_tab_close: bool,
     parent_state: Option<ParentLauncherState>,
 }
 
@@ -551,6 +555,16 @@ impl LauncherState {
         Some(action)
     }
 
+    fn close_tab_action(&self) -> Option<LauncherAction> {
+        backspace_tab_close_action(
+            self.allow_tab_close,
+            self.filtering,
+            self.filtered_entries
+                .get(self.active_idx)
+                .map(|entry| &entry.action),
+        )
+    }
+
     fn move_up(&mut self) {
         self.active_idx = self.active_idx.saturating_sub(1);
         if self.active_idx < self.top_row {
@@ -658,6 +672,9 @@ impl LauncherState {
                     key: KeyCode::Backspace,
                     ..
                 }) => {
+                    if let Some(action) = self.close_tab_action() {
+                        return Ok(Some(action));
+                    }
                     if !self.filtering {
                         self.selection.pop();
                     } else {
@@ -746,14 +763,35 @@ impl LauncherState {
     }
 }
 
+fn backspace_tab_close_action(
+    allow_tab_close: bool,
+    filtering: bool,
+    action: Option<&LauncherAction>,
+) -> Option<LauncherAction> {
+    if !allow_tab_close || filtering {
+        return None;
+    }
+
+    match action {
+        Some(LauncherAction::ActivatePane { tab_id, .. }) => {
+            Some(LauncherAction::CloseNavigatorTab(*tab_id))
+        }
+        _ => None,
+    }
+}
+
 fn launcher_tab_action(tab: &LauncherTabEntry) -> LauncherAction {
-    LauncherAction::ActivatePane(tab.pane_id)
+    LauncherAction::ActivatePane {
+        pane_id: tab.pane_id,
+        tab_id: tab.tab_id,
+    }
 }
 
 pub fn launcher(
     args: LauncherArgs,
     mut term: TermWizTerminal,
     initial_choice_idx: usize,
+    allow_tab_close: bool,
 ) -> anyhow::Result<Option<LauncherAction>> {
     let filtering = args.flags.contains(LauncherFlags::FUZZY);
     let mut state = LauncherState {
@@ -770,6 +808,7 @@ pub fn launcher(
         selection: String::new(),
         alphabet: args.alphabet.clone(),
         always_fuzzy: filtering,
+        allow_tab_close,
         parent_state: None,
     };
 
@@ -785,16 +824,54 @@ pub fn launcher(
 mod tests {
     use super::*;
 
+    fn pane_action(tab_id: TabId) -> LauncherAction {
+        LauncherAction::ActivatePane {
+            pane_id: 42.into(),
+            tab_id,
+        }
+    }
+
     #[test]
     fn pane_entries_keep_the_stable_pane_id() {
         let entry = LauncherTabEntry {
             title: "  |- src/main.rs".to_string(),
             pane_id: 42.into(),
+            tab_id: TabId::new(7),
         };
 
         assert_eq!(
             launcher_tab_action(&entry),
-            LauncherAction::ActivatePane(42.into())
+            LauncherAction::ActivatePane {
+                pane_id: 42.into(),
+                tab_id: TabId::new(7),
+            }
+        );
+    }
+
+    #[test]
+    fn backspace_closes_the_selected_tab_in_the_navigator() {
+        let action = pane_action(TabId::new(7));
+
+        assert_eq!(
+            backspace_tab_close_action(true, false, Some(&action)),
+            Some(LauncherAction::CloseNavigatorTab(TabId::new(7)))
+        );
+    }
+
+    #[test]
+    fn backspace_does_not_close_a_tab_while_filtering() {
+        let action = pane_action(TabId::new(7));
+
+        assert_eq!(backspace_tab_close_action(true, true, Some(&action)), None);
+    }
+
+    #[test]
+    fn backspace_does_not_close_a_tab_in_a_custom_launcher() {
+        let action = pane_action(TabId::new(7));
+
+        assert_eq!(
+            backspace_tab_close_action(false, false, Some(&action)),
+            None
         );
     }
 }

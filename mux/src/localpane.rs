@@ -554,6 +554,10 @@ impl Pane for LocalPane {
         }
     }
 
+    fn application_cursor_keys_enabled(&self) -> bool {
+        self.terminal.lock().application_cursor_keys_enabled()
+    }
+
     fn is_alt_screen_active(&self) -> bool {
         if self.tmux_domain.lock().is_some() {
             false

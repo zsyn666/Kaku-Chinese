@@ -60,22 +60,63 @@ if [ -n "${ZSH_NAME-}" ] && alias ssh >/dev/null 2>&1; then
       _kaku_ssh_cmd=(command ssh "${(@)_kaku_alias_words[2,-1]}")
     elif [[ "${_kaku_alias_words[1]-}" == "command" && "${_kaku_alias_words[2]-}" == "ssh" ]]; then
       _kaku_ssh_cmd=(command ssh "${(@)_kaku_alias_words[3,-1]}")
+    elif [[ "${_kaku_alias_words[1]-}" == *=* ]]; then
+      # Alias starts with VAR=value prefixes; expanded array words are not
+      # re-parsed as assignments, so route through env.
+      _kaku_ssh_cmd=(env "${_kaku_alias_words[@]}")
     else
       _kaku_ssh_cmd=("${_kaku_alias_words[@]}")
     fi
+    local _kaku_1p_opt=""
+    if [ -z "${KAKU_SSH_SKIP_1PASSWORD_FIX-}" ]; then
+      case "${SSH_AUTH_SOCK-}" in
+        *1password*|*2BUA8C4S2C*)
+          case " $* " in
+            *IdentitiesOnly=*) ;;
+            *) _kaku_1p_opt="-oIdentitiesOnly=yes" ;;
+          esac
+          ;;
+      esac
+    fi
     if [[ -z "${KAKU_SSH_SKIP_TERM_FIX-}" && "${TERM:-}" == "kaku" ]]; then
-      TERM=xterm-256color "${_kaku_ssh_cmd[@]}" "$@"
+      TERM=xterm-256color "${_kaku_ssh_cmd[@]}" ${_kaku_1p_opt:+"$_kaku_1p_opt"} "$@"
     else
-      "${_kaku_ssh_cmd[@]}" "$@"
+      "${_kaku_ssh_cmd[@]}" ${_kaku_1p_opt:+"$_kaku_1p_opt"} "$@"
     fi
   }
   unalias ssh
 elif ! typeset -f ssh >/dev/null 2>&1; then
   function ssh {
+    local _kaku_1p_opt=""
+    if [ -z "${KAKU_SSH_SKIP_1PASSWORD_FIX-}" ]; then
+      case "${SSH_AUTH_SOCK-}" in
+        *1password*|*2BUA8C4S2C*)
+          case " $* " in
+            *IdentitiesOnly=*) ;;
+            *) _kaku_1p_opt="-oIdentitiesOnly=yes" ;;
+          esac
+          ;;
+      esac
+    fi
     if [[ -z "${KAKU_SSH_SKIP_TERM_FIX-}" && "${TERM:-}" == "kaku" ]]; then
-      TERM=xterm-256color command ssh "$@"
+      TERM=xterm-256color command ssh ${_kaku_1p_opt:+"$_kaku_1p_opt"} "$@"
     else
-      command ssh "$@"
+      command ssh ${_kaku_1p_opt:+"$_kaku_1p_opt"} "$@"
+    fi
+  }
+fi
+
+# Same TERM fix for mosh: mosh-server inherits TERM on the remote side, so a
+# kaku TERM breaks remote rendering exactly like plain ssh would. Guard: keep
+# user-defined mosh functions and aliases untouched. Self-contained (#493).
+if command -v mosh >/dev/null 2>&1 \
+  && ! typeset -f mosh >/dev/null 2>&1 \
+  && ! alias mosh >/dev/null 2>&1; then
+  function mosh {
+    if [[ -z "${KAKU_SSH_SKIP_TERM_FIX-}" && "${TERM:-}" == "kaku" ]]; then
+      TERM=xterm-256color command mosh "$@"
+    else
+      command mosh "$@"
     fi
   }
 fi

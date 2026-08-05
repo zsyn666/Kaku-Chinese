@@ -42,7 +42,7 @@ pub async fn spawn_command_internal(
     size: TerminalSize,
     src_window_id: Option<MuxWindowId>,
     term_config: Arc<TermConfig>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<MuxWindowId> {
     let mux = Mux::get();
     let activity = Activity::new();
 
@@ -99,7 +99,7 @@ pub async fn spawn_command_internal(
 
     let workspace = mux.active_workspace().clone();
 
-    match spawn_where {
+    let window_id = match spawn_where {
         SpawnWhere::SplitPane(direction) => {
             let src_window_id = match src_window_id {
                 Some(id) => id,
@@ -133,6 +133,7 @@ pub async fn spawn_command_internal(
             } else {
                 bail!("there is no active tab while splitting pane!?");
             }
+            src_window_id
         }
         _ => {
             let (_tab, pane, window_id) = mux
@@ -159,10 +160,11 @@ pub async fn spawn_command_internal(
             if Some(window_id) == src_window_id {
                 pane.set_config(term_config);
             }
+            window_id
         }
     };
 
     drop(activity);
 
-    Ok(())
+    Ok(window_id)
 }

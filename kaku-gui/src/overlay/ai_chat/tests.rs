@@ -24,9 +24,24 @@ mod markdown_tests {
         }
     }
 
+    fn light_palette() -> ChatPalette {
+        ChatPalette {
+            bg: SrgbaTuple(1.0, 0.99, 0.94, 1.0),
+            fg: SrgbaTuple(0.25, 0.24, 0.23, 1.0),
+            accent: SrgbaTuple(0.0, 1.0, 1.0, 1.0),
+            border: SrgbaTuple(0.45, 0.43, 0.40, 1.0),
+            user_header: SrgbaTuple(0.8, 0.6, 0.0, 1.0),
+            user_text: SrgbaTuple(0.25, 0.24, 0.23, 1.0),
+            ai_text: SrgbaTuple(0.25, 0.24, 0.23, 1.0),
+            selection_fg: SrgbaTuple(1.0, 1.0, 1.0, 1.0),
+            selection_bg: SrgbaTuple(0.2, 0.4, 0.8, 1.0),
+        }
+    }
+
     fn test_context() -> TerminalContext {
         TerminalContext {
             cwd: "/tmp".to_string(),
+            remote_host: None,
             visible_lines: vec!["line 1".to_string()],
             tab_snapshot: "cargo test\nerror: boom".to_string(),
             selected_text: "selected snippet".to_string(),
@@ -169,17 +184,7 @@ mod markdown_tests {
 
     #[test]
     fn light_theme_heading_text_falls_back_to_foreground() {
-        let pal = ChatPalette {
-            bg: SrgbaTuple(1.0, 0.99, 0.94, 1.0),
-            fg: SrgbaTuple(0.25, 0.24, 0.23, 1.0),
-            accent: SrgbaTuple(0.0, 1.0, 1.0, 1.0),
-            border: SrgbaTuple(0.45, 0.43, 0.40, 1.0),
-            user_header: SrgbaTuple(0.8, 0.6, 0.0, 1.0),
-            user_text: SrgbaTuple(0.25, 0.24, 0.23, 1.0),
-            ai_text: SrgbaTuple(0.25, 0.24, 0.23, 1.0),
-            selection_fg: SrgbaTuple(1.0, 1.0, 1.0, 1.0),
-            selection_bg: SrgbaTuple(0.2, 0.4, 0.8, 1.0),
-        };
+        let pal = light_palette();
         assert!(pal.is_light());
         let marker = pal.heading_marker_cell();
         let text = pal.heading_text_cell();
@@ -188,6 +193,38 @@ mod markdown_tests {
             format!("{:?}", text.foreground()),
             "marker and body should use distinct colors"
         );
+    }
+
+    #[test]
+    fn running_chat_applies_latest_palette_and_invalidates_display_cache() {
+        let (palette_tx, palette_rx) = std::sync::mpsc::channel();
+        let mut colors = test_palette();
+        let mut display_lines_dirty = false;
+
+        palette_tx.send(light_palette()).unwrap();
+        assert!(drain_palette_updates(
+            &palette_rx,
+            &mut colors,
+            &mut display_lines_dirty
+        ));
+        assert!(colors.is_light());
+        assert!(display_lines_dirty);
+
+        display_lines_dirty = false;
+        palette_tx.send(light_palette()).unwrap();
+        palette_tx.send(test_palette()).unwrap();
+        assert!(drain_palette_updates(
+            &palette_rx,
+            &mut colors,
+            &mut display_lines_dirty
+        ));
+        assert!(!colors.is_light());
+        assert!(display_lines_dirty);
+        assert!(!drain_palette_updates(
+            &palette_rx,
+            &mut colors,
+            &mut display_lines_dirty
+        ));
     }
 
     #[test]
@@ -384,6 +421,7 @@ mod markdown_tests {
         std::fs::create_dir(dir.path().join("src")).unwrap();
         let context = TerminalContext {
             cwd: dir.path().to_string_lossy().into_owned(),
+            remote_host: None,
             visible_lines: vec![],
             tab_snapshot: String::new(),
             selected_text: String::new(),
@@ -412,8 +450,9 @@ mod markdown_tests {
         assert!(approval_summary("fs_patch", &args).is_some());
         assert!(approval_summary("fs_mkdir", &args).is_some());
         assert!(approval_summary("fs_delete", &args).is_some());
-        // http_request: mutating methods require approval
-        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+        // Every direct request requires approval, including GET, because the
+        // destination can expose data outside the model conversation.
+        for method in ["GET", "POST", "PUT", "PATCH", "DELETE"] {
             let args = serde_json::json!({"method": method, "url": "https://api.example.com/data"});
             assert!(
                 approval_summary("http_request", &args).is_some(),
@@ -432,9 +471,6 @@ mod markdown_tests {
         assert!(approval_summary("pwd", &serde_json::json!({})).is_none());
         assert!(approval_summary("shell_poll", &serde_json::json!({"pid": 123})).is_none());
         assert!(approval_summary("unknown_tool", &args).is_none());
-        // http_request: GET is read-only
-        let args = serde_json::json!({"method": "GET", "url": "https://api.example.com/data"});
-        assert!(approval_summary("http_request", &args).is_none());
     }
 
     #[test]
@@ -768,6 +804,7 @@ mod markdown_tests {
     fn visible_snapshot_message_prefixes_each_line() {
         let msg = build_visible_snapshot_message(&TerminalContext {
             cwd: "/tmp".to_string(),
+            remote_host: None,
             visible_lines: vec![
                 "line 1".to_string(),
                 "```".to_string(),

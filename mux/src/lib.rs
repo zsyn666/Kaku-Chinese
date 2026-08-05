@@ -279,9 +279,8 @@ fn rescue_user_var_actions(pane_id: PaneId, actions: &[Action]) {
             }) = osc.as_ref()
             {
                 log::debug!(
-                    "rescue_user_var_actions: rescued SetUserVar {}={} from dead pane {}",
+                    "rescue_user_var_actions: rescued SetUserVar {} from dead pane {}",
                     name,
-                    value,
                     pane_id
                 );
                 Mux::notify_from_any_thread(MuxNotification::Alert {

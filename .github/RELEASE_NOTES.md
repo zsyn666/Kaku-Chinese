@@ -1,25 +1,27 @@
-# V0.14.0 Focused
+# V0.17.0 Linked
 
 <div align="center">
   <img src="https://raw.githubusercontent.com/tw93/Kaku/main/assets/logo.png" alt="Kaku Logo" width="120" height="120" />
-  <h1 style="margin: 12px 0 6px;">Kaku V0.14.0</h1>
+  <h1 style="margin: 12px 0 6px;">Kaku V0.17.0</h1>
   <p><em>A fast, out-of-the-box terminal built for AI coding.</em></p>
 </div>
 
 ### Changelog
 
-1. **Pane Navigation**: Tab Navigator now lists every pane inside split tabs and lets you jump directly to the one you need, while narrow tab titles keep the active pane visible.
-2. **Tab Renaming**: The rename dialog has clearer text and cursor behavior, canceling with Escape or the mouse no longer leaves a phantom selection, and automatic split-pane titles stay intact.
-3. **Tabs & Selection**: Tab separators are cleaner, selected text is easier to see in dark themes, and double-click selection now respects boundaries between CJK and Latin text.
-4. **Session Restore**: Closed tabs stay closed after restart, incomplete restores preserve the original recovery data, and SSH sessions can be restored from saved snapshots again.
-5. **Security & Stability**: Dependency advisories for `anyhow` and `crossbeam-epoch` are resolved, while pane actions and mouse releases handle disappearing UI state more safely.
+1. **Responses API and Native Search**: Choose `api_mode = "responses"` for Responses-compatible endpoints, and turn on provider-hosted web search without a separate search key.
+2. **Pick Your Managed Shell**: `kaku init` can install zsh or fish on purpose, and Kaku keeps that choice across XDG config paths instead of only trusting `$SHELL`.
+3. **Richer Terminal Clicks**: Cmd+Click opens bare domains like `github.com`, file links can launch your editor via `config.file_link_editor`, and Option+Click moves the cursor inside the current input line.
+4. **Safer AI Tools**: Tool paths, web requests, and code search are harder to abuse; incomplete streams no longer look like successful turns.
+5. **Stability Fixes**: Launch no longer dies on oversized draw batches, windows stay below the menu bar, top tabs line up with traffic lights, font fallback is safer, and shell state plus drag-select scroll behave more predictably.
 
 ### 更新日志
 
-1. **分屏导航**：Tab Navigator 现在会列出标签内的每个分屏，可以直接跳到需要的分屏；标签很窄时也会优先保留当前分屏标题。
-2. **标签重命名**：重命名窗口的文字与光标表现更清楚，按 Esc 或用鼠标取消后不再留下错误选区，自动生成的分屏标题也不会被意外覆盖。
-3. **标签与选择**：标签分隔线更简洁，深色主题下的选区更清楚，双击选择也会正确区分中日韩文字与拉丁文字的边界。
-4. **会话恢复**：重启后不会再恢复已经关闭的标签，恢复不完整时会保留原始恢复数据，SSH 会话也能再次从快照中恢复。
-5. **安全与稳定性**：已解决 `anyhow` 与 `crossbeam-epoch` 的安全公告，分屏操作和鼠标释放在界面状态变化时也会更稳。
+1. **Responses API 与原生搜索**：兼容端点可选 `api_mode = "responses"`，并开启服务商托管的 web search，不必再配单独搜索 Key。
+2. **自选托管 Shell**：`kaku init` 可明确安装 zsh 或 fish，选择会写入状态并在 XDG 路径间保持一致，不再只听 `$SHELL`。
+3. **更完整的点击交互**：Cmd+Click 可打开 `github.com` 这类裸域名；文件链接可用 `config.file_link_editor` 指定编辑器；Option+Click 可在当前输入行内移动光标。
+4. **更安全的 AI 工具**：路径、网络请求与代码搜索边界更严；流式被截断时不会再被当成成功回合。
+5. **稳定性修复**：超大绘制批次不再导致启动崩溃，窗口不会拖进菜单栏后方，顶栏标签与红绿灯对齐，字体回退更安全，Shell 状态与拖选滚动也更稳。
+
+Special thanks to @ddotz and @F1Justin for their contributions to this release.
 
 > https://github.com/tw93/Kaku

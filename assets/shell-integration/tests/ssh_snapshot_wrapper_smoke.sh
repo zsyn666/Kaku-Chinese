@@ -89,4 +89,66 @@ grep -Fqx 'ARG=<semi;colon>' <<<"$output" \
 grep -Fqx 'ARG=<$(printf SENTINEL)>' <<<"$output" \
   || fail "command-substitution-shaped argument was not preserved literally"
 
+# Helper: run a live (non-snapshot) zsh with the generated integration and
+# print what the fake ssh binary received.
+live_ssh() {
+  # $1 = setup script (alias definitions etc.), rest = env assignments
+  local setup="$1"; shift
+  HOME="$tmp_home" \
+    PATH="$tmp_bin:$PATH" \
+    TERM=xterm-256color \
+    KAKU_ZSH="$kaku_zsh" \
+    env "$@" \
+    zsh -fc "
+      $setup
+      source \"\$KAKU_ZSH\"
+      TERM=kaku ssh probe-host
+    " 2>&1
+}
+
+# Live shell keeps the user's alias flags (the snapshot path above is allowed
+# to drop them, the live path is not).
+output="$(live_ssh 'alias ssh="ssh -p 2200"')" || true
+grep -Fqx 'ARG=<-p>' <<<"$output" && grep -Fqx 'ARG=<2200>' <<<"$output" \
+  || fail "live wrapper dropped the alias flags"
+
+# An env-prefix alias must still reach ssh instead of failing on the
+# assignment word.
+output="$(live_ssh 'alias ssh="LC_ALL=C ssh"')" || true
+grep -Fqx 'ARG=<probe-host>' <<<"$output" \
+  || fail "env-prefix ssh alias did not reach ssh"
+
+# 1Password agent socket injects IdentitiesOnly=yes exactly once...
+output="$(live_ssh '' SSH_AUTH_SOCK=/tmp/1password/agent.sock)" || true
+grep -Fqx 'ARG=<IdentitiesOnly=yes>' <<<"$output" \
+  || fail "1Password socket did not inject IdentitiesOnly=yes"
+
+# ...but not when the user already passed it or opted out.
+output="$(HOME="$tmp_home" PATH="$tmp_bin:$PATH" TERM=xterm-256color \
+  KAKU_ZSH="$kaku_zsh" SSH_AUTH_SOCK=/tmp/1password/agent.sock \
+  zsh -fc 'source "$KAKU_ZSH"; TERM=kaku ssh -oIdentitiesOnly=no probe-host' 2>&1)"
+grep -Fqx 'ARG=<IdentitiesOnly=yes>' <<<"$output" \
+  && fail "IdentitiesOnly=yes was injected despite an explicit user setting"
+output="$(live_ssh '' SSH_AUTH_SOCK=/tmp/1password/agent.sock KAKU_SSH_SKIP_1PASSWORD_FIX=1)" || true
+grep -Fqx 'ARG=<IdentitiesOnly=yes>' <<<"$output" \
+  && fail "IdentitiesOnly=yes was injected despite KAKU_SSH_SKIP_1PASSWORD_FIX=1"
+
+# The TERM fix honors its opt-out toggle.
+output="$(live_ssh '' KAKU_SSH_SKIP_TERM_FIX=1)" || true
+grep -Fqx 'TERM=kaku' <<<"$output" \
+  || fail "KAKU_SSH_SKIP_TERM_FIX=1 did not keep TERM untouched"
+
+# mosh gets the same TERM fallback (wrapper only defined when mosh exists,
+# so the fake binary must be on PATH before the integration is sourced).
+cat >"$tmp_bin/mosh" <<'EOF'
+#!/bin/sh
+printf 'TERM=%s\n' "${TERM-}"
+EOF
+chmod +x "$tmp_bin/mosh"
+output="$(HOME="$tmp_home" PATH="$tmp_bin:$PATH" TERM=xterm-256color \
+  KAKU_ZSH="$kaku_zsh" \
+  zsh -fc 'source "$KAKU_ZSH"; TERM=kaku mosh probe-host' 2>&1)"
+grep -Fqx 'TERM=xterm-256color' <<<"$output" \
+  || fail "mosh wrapper did not apply the TERM fallback"
+
 echo "ssh snapshot wrapper smoke test passed"

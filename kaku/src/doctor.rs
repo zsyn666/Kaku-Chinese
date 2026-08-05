@@ -1,6 +1,6 @@
 //! Doctor command for diagnosing shell integration, environment, and runtime issues.
 
-use crate::shell::{detect_shell_kind, ShellKind};
+use crate::shell::{resolve_shell_kind, ManagedShell, ShellKind};
 use clap::Parser;
 use std::fs;
 use std::io::{self, ErrorKind, Write};
@@ -17,21 +17,25 @@ pub struct DoctorCommand {
     /// Prompt before offering safe automatic fixes
     #[arg(long)]
     pub prompt_fix: bool,
+
+    /// Shell integration to diagnose and repair
+    #[arg(long, value_enum)]
+    pub shell: Option<ManagedShell>,
 }
 
 impl DoctorCommand {
     pub fn run(&self) -> anyhow::Result<()> {
-        let report = build_report();
+        let report = build_report(self.shell);
         print!("{}", render_text_report(&report));
 
         if self.fix {
-            run_auto_fix_and_rerun_report();
+            run_auto_fix_and_rerun_report(self.shell);
             return Ok(());
         }
 
         if self.prompt_fix && should_offer_auto_fix(&report) {
             match prompt_yes_no("Run safe auto-fix now with `kaku init --update-only`? [Y/n] ") {
-                Ok(true) => run_auto_fix_and_rerun_report(),
+                Ok(true) => run_auto_fix_and_rerun_report(self.shell),
                 Ok(false) => {}
                 Err(err) => eprintln!("Auto-fix prompt skipped: {}", err),
             }
@@ -58,15 +62,18 @@ fn prompt_yes_no(question: &str) -> anyhow::Result<bool> {
     Ok(answer.is_empty() || answer == "y" || answer == "yes")
 }
 
-fn run_auto_fix_and_rerun_report() {
+fn run_auto_fix_and_rerun_report(shell: Option<ManagedShell>) {
     println!("Auto-fix: running `kaku init --update-only`");
-    let init_cmd = crate::init::InitCommand { update_only: true };
+    let init_cmd = crate::init::InitCommand {
+        update_only: true,
+        shell,
+    };
     match init_cmd.run() {
         Ok(()) => println!("Auto-fix: completed"),
         Err(err) => println!("Auto-fix: failed: {:#}", err),
     }
 
-    let after = build_report();
+    let after = build_report(shell);
     println!();
     println!("After Auto-fix");
     print!("{}", render_text_report(&after));
@@ -140,10 +147,11 @@ struct DoctorCheck {
     fix: Option<String>,
 }
 
-fn build_report() -> DoctorReport {
-    let env_group = build_environment_group();
-    let shell_group = build_shell_integration_group();
-    let runtime_group = build_runtime_group();
+fn build_report(shell: Option<ManagedShell>) -> DoctorReport {
+    let shell_kind = resolve_shell_kind(shell);
+    let env_group = build_environment_group(&shell_kind, shell);
+    let shell_group = build_shell_integration_group(&shell_kind, shell);
+    let runtime_group = build_runtime_group(&shell_kind);
 
     let mut all_checks = Vec::new();
     all_checks.extend(env_group.checks.iter());
@@ -223,12 +231,33 @@ fn build_health_group(overall_status: DoctorStatus, summary: &DoctorSummary) -> 
     }
 }
 
-fn build_environment_group() -> DoctorGroup {
+fn init_update_command(shell: Option<ManagedShell>) -> String {
+    match shell {
+        Some(shell) => format!("kaku init --update-only --shell {}", shell.name()),
+        None => "kaku init --update-only".to_string(),
+    }
+}
+
+fn build_environment_group(
+    shell_kind: &ShellKind,
+    selected_shell: Option<ManagedShell>,
+) -> DoctorGroup {
     let mut checks = Vec::new();
 
     let shell = std::env::var("SHELL").ok();
-    let shell_kind = detect_shell_kind();
     let shell_supported = shell_kind.is_managed();
+    let mut shell_details = vec![
+        "Kaku shell integration supports zsh and fish for PATH injection and managed shell config"
+            .to_string(),
+        "Doctor reports the current process environment. GUI-launched apps can differ from a Terminal login shell."
+            .to_string(),
+    ];
+    if let Some(selected) = selected_shell {
+        shell_details.push(format!(
+            "The --shell {} override selects which integration Doctor checks and repairs",
+            selected.name()
+        ));
+    }
 
     checks.push(DoctorCheck {
         title: "Current Shell Environment",
@@ -239,17 +268,29 @@ fn build_environment_group() -> DoctorGroup {
         } else {
             DoctorStatus::Info
         },
-        summary: match &shell {
-            Some(value) if shell_supported => format!("SHELL is {value}"),
-            Some(value) => format!("SHELL is {value} (zsh and fish are supported)"),
-            None => "SHELL is not set".to_string(),
+        summary: match (selected_shell, &shell) {
+            (Some(selected), Some(value)) => {
+                format!(
+                    "Selected {} via --shell (SHELL is {value})",
+                    selected.name()
+                )
+            }
+            (Some(selected), None) => format!("Selected {} via --shell", selected.name()),
+            (None, Some(value)) if shell_supported => {
+                // Diagnosis follows the persisted selection, not $SHELL; say
+                // so when they disagree (e.g. chsh to bash after `kaku init`).
+                match crate::shell::persisted_managed_shell() {
+                    Some(persisted) if !value.ends_with(persisted.name()) => format!(
+                        "Checking selected {} integration (SHELL is {value})",
+                        persisted.name()
+                    ),
+                    _ => format!("SHELL is {value}"),
+                }
+            }
+            (None, Some(value)) => format!("SHELL is {value} (zsh and fish are supported)"),
+            (None, None) => "SHELL is not set".to_string(),
         },
-        details: vec![
-            "Kaku shell integration supports zsh and fish for PATH injection and managed shell config"
-                .to_string(),
-            "Doctor reports the current process environment. GUI-launched apps can differ from a Terminal login shell."
-                .to_string(),
-        ],
+        details: shell_details,
         fix: if !shell_supported {
             Some("Use zsh or fish, or add the kaku bin dir to your shell PATH manually".to_string())
         } else {
@@ -258,15 +299,16 @@ fn build_environment_group() -> DoctorGroup {
     });
 
     if shell_kind.is_managed() {
-        let managed_bin = managed_bin_dir();
+        let managed_bin = managed_bin_dir(shell_kind);
         let path_entries: Vec<PathBuf> =
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()).collect();
         let path_has_managed_bin = path_entries.iter().any(|entry| entry == &managed_bin);
         let bin_dir_display = managed_bin.display().to_string();
-        let restart_hint = if shell_kind == ShellKind::Fish {
-            "Run `kaku init --update-only` and restart fish".to_string()
+        let init_command = init_update_command(selected_shell);
+        let restart_hint = if *shell_kind == ShellKind::Fish {
+            format!("Run `{init_command}` and restart fish")
         } else {
-            "Run `kaku init --update-only` and restart zsh with `exec zsh -l`".to_string()
+            format!("Run `{init_command}` and restart zsh with `exec zsh -l`")
         };
         checks.push(DoctorCheck {
             title: "PATH Contains Kaku Managed Bin",
@@ -293,7 +335,7 @@ fn build_environment_group() -> DoctorGroup {
             },
         });
 
-        if shell_kind == ShellKind::Fish {
+        if *shell_kind == ShellKind::Fish {
             let conf_d = home_dir()
                 .join(".config")
                 .join("fish")
@@ -382,9 +424,11 @@ fn wrapper_check(
     }
 }
 
-fn build_shell_integration_group() -> DoctorGroup {
+fn build_shell_integration_group(
+    shell_kind: &ShellKind,
+    selected_shell: Option<ManagedShell>,
+) -> DoctorGroup {
     let mut checks = Vec::new();
-    let shell_kind = detect_shell_kind();
 
     if !shell_kind.is_managed() {
         checks.push(DoctorCheck {
@@ -404,14 +448,15 @@ fn build_shell_integration_group() -> DoctorGroup {
         };
     }
 
-    let is_fish = shell_kind == ShellKind::Fish;
+    let is_fish = *shell_kind == ShellKind::Fish;
+    let init_command = init_update_command(selected_shell);
     let autosuggest_provider = if is_fish {
         None
     } else {
         detect_external_autosuggest_cli_provider()
     };
 
-    let init_file = managed_init_file();
+    let init_file = managed_init_file(shell_kind);
     let init_exists = init_file.is_file();
     let init_title = if is_fish {
         "Managed Fish Init File"
@@ -434,7 +479,7 @@ fn build_shell_integration_group() -> DoctorGroup {
         fix: if init_exists {
             None
         } else {
-            Some("Run `kaku init --update-only`".to_string())
+            Some(format!("Run `{init_command}`"))
         },
     });
 
@@ -444,7 +489,7 @@ fn build_shell_integration_group() -> DoctorGroup {
 
     checks.push(wrapper_check(
         "Kaku Wrapper Script",
-        managed_wrapper_path(),
+        managed_wrapper_path(shell_kind),
         DoctorStatus::Fail,
         vec![
             "The `kaku` shell command is provided by this wrapper".to_string(),
@@ -454,7 +499,7 @@ fn build_shell_integration_group() -> DoctorGroup {
 
     checks.push(wrapper_check(
         "k Wrapper Script",
-        managed_bin_dir().join("k"),
+        managed_bin_dir(shell_kind).join("k"),
         DoctorStatus::Warn,
         vec![
             "The `k` command launches AI chat from any terminal".to_string(),
@@ -503,7 +548,7 @@ fn build_shell_integration_group() -> DoctorGroup {
             fix: if source_check.has_valid_source {
                 None
             } else {
-                Some("Run `kaku init --update-only`".to_string())
+                Some(format!("Run `{init_command}`"))
             },
         });
     } else {
@@ -547,7 +592,7 @@ fn build_shell_integration_group() -> DoctorGroup {
             } else if source_check.has_active_lines() && !source_check.has_legacy_guarded_lines() {
                 None
             } else {
-                Some("Run `kaku init --update-only`".to_string())
+                Some(format!("Run `{init_command}`"))
             },
         });
     }
@@ -559,7 +604,7 @@ fn build_shell_integration_group() -> DoctorGroup {
     }
 }
 
-fn build_runtime_group() -> DoctorGroup {
+fn build_runtime_group(shell_kind: &ShellKind) -> DoctorGroup {
     let mut checks = Vec::new();
 
     let candidates = kaku_bin_candidates();
@@ -589,7 +634,7 @@ fn build_runtime_group() -> DoctorGroup {
         },
     });
 
-    let wrapper = managed_wrapper_path();
+    let wrapper = managed_wrapper_path(shell_kind);
     let wrapper_probe = probe_wrapper(&wrapper);
     checks.push(DoctorCheck {
         title: "Wrapper Execution Probe",
@@ -599,7 +644,7 @@ fn build_runtime_group() -> DoctorGroup {
         fix: wrapper_probe.fix,
     });
 
-    let login_shell_probe = probe_login_shell_integration();
+    let login_shell_probe = probe_login_shell_integration(shell_kind);
     checks.push(DoctorCheck {
         title: login_shell_probe.title,
         status: login_shell_probe.status,
@@ -1173,10 +1218,8 @@ fn probe_wrapper(wrapper: &Path) -> DoctorCheck {
     }
 }
 
-fn probe_login_shell_integration() -> DoctorCheck {
-    let shell_kind = detect_shell_kind();
-
-    let (title, detail_exec, detail_verify) = match &shell_kind {
+fn probe_login_shell_integration(shell_kind: &ShellKind) -> DoctorCheck {
+    let (title, detail_exec, detail_verify) = match shell_kind {
         ShellKind::Fish => (
             "Login Fish Integration Probe",
             "Doctor does not execute `fish -l` because interactive login startup files can run user-defined commands, plugin managers, and network actions.",
@@ -1210,8 +1253,8 @@ fn home_dir() -> PathBuf {
     config::HOME_DIR.clone()
 }
 
-fn managed_bin_dir() -> PathBuf {
-    let shell_dir = if detect_shell_kind() == ShellKind::Fish {
+fn managed_bin_dir(shell_kind: &ShellKind) -> PathBuf {
+    let shell_dir = if *shell_kind == ShellKind::Fish {
         "fish"
     } else {
         "zsh"
@@ -1223,12 +1266,12 @@ fn managed_bin_dir() -> PathBuf {
         .join("bin")
 }
 
-fn managed_wrapper_path() -> PathBuf {
-    managed_bin_dir().join("kaku")
+fn managed_wrapper_path(shell_kind: &ShellKind) -> PathBuf {
+    managed_bin_dir(shell_kind).join("kaku")
 }
 
-fn managed_init_file() -> PathBuf {
-    if detect_shell_kind() == ShellKind::Fish {
+fn managed_init_file(shell_kind: &ShellKind) -> PathBuf {
+    if *shell_kind == ShellKind::Fish {
         home_dir()
             .join(".config")
             .join("kaku")
@@ -1380,10 +1423,19 @@ mod tests {
 
     #[test]
     fn login_probe_is_passive_and_non_executing() {
-        let check = probe_login_shell_integration();
+        let check = probe_login_shell_integration(&ShellKind::Zsh);
         assert_eq!(check.status, DoctorStatus::Info);
         assert!(check.summary.contains("Skipped interactive login"));
         assert!(check.fix.is_none());
+    }
+
+    #[test]
+    fn explicit_shell_is_preserved_in_auto_fix_command() {
+        assert_eq!(
+            init_update_command(Some(ManagedShell::Fish)),
+            "kaku init --update-only --shell fish"
+        );
+        assert_eq!(init_update_command(None), "kaku init --update-only");
     }
 
     #[test]

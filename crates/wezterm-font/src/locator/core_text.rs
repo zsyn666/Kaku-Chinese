@@ -58,7 +58,15 @@ fn descriptor_from_attr(attr: &FontAttributes) -> anyhow::Result<CFArray<CTFontD
     if array.is_null() {
         anyhow::bail!("no font matches {:?}", attr);
     } else {
-        Ok(unsafe { CFArray::wrap_under_get_rule(array) })
+        Ok(unsafe { CFArray::wrap_under_create_rule(array) })
+    }
+}
+
+unsafe fn retain_autoreleased_string_array(array: id) -> Option<CFArray<CFString>> {
+    if array.is_null() {
+        None
+    } else {
+        Some(CFArray::wrap_under_get_rule(array as _))
     }
 }
 
@@ -276,8 +284,9 @@ fn build_fallback_list_impl() -> anyhow::Result<Vec<ParsedFont>> {
         .parse::<CFString>()
         .map_err(|_| anyhow::anyhow!("failed to parse lang name en as CFString"))?;
 
-    let langs: CFArray<CFString> =
-        unsafe { msg_send![user_defaults, stringArrayForKey:apple_lang] };
+    let langs: id = unsafe { msg_send![user_defaults, stringArrayForKey:apple_lang] };
+    let langs = unsafe { retain_autoreleased_string_array(langs) }
+        .ok_or_else(|| anyhow::anyhow!("AppleLanguages is unavailable"))?;
 
     let cascade = cascade_list_for_languages(&menlo, &langs);
     let mut fonts = vec![];
@@ -344,4 +353,40 @@ fn build_fallback_list_impl() -> anyhow::Result<Vec<ParsedFont>> {
     }
 
     Ok(fonts)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objc::rc::{autoreleasepool, StrongPtr};
+
+    #[test]
+    fn matching_descriptors_use_create_rule_ownership() {
+        let descriptors =
+            descriptor_from_attr(&FontAttributes::new("Menlo")).expect("resolve Menlo descriptors");
+
+        assert_eq!(descriptors.retain_count(), 1);
+    }
+
+    #[test]
+    fn objc_string_array_bridge_retains_autoreleased_value() {
+        let (array, weak) = autoreleasepool(|| {
+            let item = CFString::new("Kaku ownership probe");
+            let raw: id =
+                unsafe { msg_send![class!(NSArray), arrayWithObject:item.as_concrete_TypeRef()] };
+            let tracked = unsafe { StrongPtr::retain(raw) };
+            let weak = tracked.weak();
+            drop(tracked);
+            let array = unsafe { retain_autoreleased_string_array(raw) }
+                .expect("bridge autoreleased NSArray");
+            (array, weak)
+        });
+
+        let loaded = weak.load();
+        if (*loaded).is_null() {
+            std::mem::forget(array);
+            panic!("bridged NSArray was released with its source autorelease pool");
+        }
+        assert_eq!(array.len(), 1);
+    }
 }

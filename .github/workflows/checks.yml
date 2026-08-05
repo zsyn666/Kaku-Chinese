@@ -117,10 +117,12 @@ jobs:
             assets/shell-integration/tests/ssh_snapshot_wrapper_smoke.sh
             assets/shell-integration/tests/kiro_autosuggest_compat_smoke.sh
             assets/shell-integration/tests/cmd_backspace_binding_smoke.sh
+            assets/shell-integration/tests/ai_query_mode_smoke.sh
             assets/shell-integration/tests/fish_ai_query_clear_smoke.sh
             assets/shell-integration/tests/install_cli_tools_mise_smoke.sh
             assets/shell-integration/tests/tmux_integration_smoke.sh
             assets/shell-integration/tests/config_update_highlights_smoke.sh
+            assets/shell-integration/tests/first_run_state_smoke.sh
           )
           for test_script in "${tests[@]}"; do
             echo "::group::Running ${test_script}"

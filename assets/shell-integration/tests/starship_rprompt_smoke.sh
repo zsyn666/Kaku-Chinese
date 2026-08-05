@@ -80,6 +80,7 @@ echo "starship_rprompt: kaku.zsh created ok, running zsh" >&2
 output=""
 if ! output="$(
   TERM=xterm-256color \
+  TERM_PROGRAM=Kaku \
   PATH="$tmp_dir/bin:$PATH" \
   HOME="$HOME" \
   ZDOTDIR="$ZDOTDIR" \
@@ -120,6 +121,7 @@ esac
 seeded_output=""
 if ! seeded_output="$(
   TERM=xterm-256color \
+  TERM_PROGRAM=Kaku \
   PATH="$tmp_dir/bin:$PATH" \
   HOME="$HOME" \
   ZDOTDIR="$ZDOTDIR" \

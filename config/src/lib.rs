@@ -793,6 +793,7 @@ end
 -- config.default_cursor_style = 'SteadyBlock'        -- default 'BlinkingBar'
 -- config.cursor_blink_rate = 0                       -- 0 disables blinking; default 500
 -- config.scrollback_lines = 20000                    -- default 10000
+-- config.file_link_editor = 'zed'                    -- opens path[:line[:column]]
 --
 -- 8) Tab bar
 -- config.tab_bar_at_bottom = false                   -- default true

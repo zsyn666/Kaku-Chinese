@@ -7,6 +7,7 @@ Kaku is a macOS-native terminal emulator derived from WezTerm and tuned for AI-a
 - Read `AGENTS.md` first for the repository map, subsystem guides, risk areas, and verification matrix.
 - Read the nearest crate-level `AGENTS.md` before changing code inside a crate.
 - Use `.claude/skills/maintainer-sweep/SKILL.md` for GitHub issue/PR sweeps, CI-gated pushes, public replies, and closure decisions.
+- Use `.claude/skills/bugs/SKILL.md` (tracked under `.agents/skills/bugs/`) for proactive latent-bug / multi-entry UX sweeps with no reported symptom yet. After fixing one update or destructive-action surface, sibling-sweep the other entry points before declaring done.
 - Keep private release credentials, local keychain setup, and machine-specific runbooks out of tracked documentation.
 
 ## Common Commands

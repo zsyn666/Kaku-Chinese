@@ -2,7 +2,7 @@ use crate::termwindow::{PaneInformation, TabInformation, UIItem, UIItemType};
 use config::{ConfigHandle, TabBarColors};
 use finl_unicode::grapheme_clusters::Graphemes;
 use mlua::FromLua;
-use mux::pane::CachePolicy;
+use mux::pane::{CachePolicy, Pane};
 use mux::tab::TabId;
 use mux::Mux;
 use std::path::Path;
@@ -314,17 +314,25 @@ fn tab_multi_pane_title(tab_id: TabId, include_foreground_process: bool) -> Opti
         let Some(real_pane) = mux.get_pane(pos.pane.pane_id()) else {
             continue;
         };
-        let process_title = if include_foreground_process {
-            foreground_process_title(&*real_pane)
+        // A remote pane's cwd path is on the other host; the host name is the
+        // useful context there, not the path or the local `ssh` process.
+        let segment = if let Some(host) = ssh_destination_for_real_pane(&real_pane) {
+            ssh_title(&host)
         } else {
-            None
-        };
-        let path_title = real_pane
-            .get_current_working_dir(CachePolicy::AllowStale)
-            .and_then(|cwd| path_title_from_str(cwd.path()));
-        let Some(segment) = context_process_title(path_title.as_deref(), process_title.as_deref())
-        else {
-            continue;
+            let process_title = if include_foreground_process {
+                foreground_process_title(&*real_pane)
+            } else {
+                None
+            };
+            let path_title = real_pane
+                .get_current_working_dir(CachePolicy::AllowStale)
+                .and_then(|cwd| path_title_from_str(cwd.path()));
+            let Some(segment) =
+                context_process_title(path_title.as_deref(), process_title.as_deref())
+            else {
+                continue;
+            };
+            segment
         };
         if !parts.iter().any(|p| p == &segment) {
             parts.push(segment);
@@ -344,7 +352,7 @@ fn compute_tab_title_from_precomputed(
     if let Some(pane) = &tab.active_pane {
         if tab.tab_title.is_empty() {
             if let Some(ssh_host) = ssh_destination_for_pane(pane) {
-                return build_default_title(tab, config, &ssh_host, false, true);
+                return build_default_title(tab, config, &ssh_title(&ssh_host), false, true);
             }
         }
     }
@@ -363,7 +371,7 @@ fn compute_tab_title_from_precomputed(
                 {
                     context_title
                 } else if let Some(ssh_host) = ssh_destination_for_pane(pane) {
-                    ssh_host
+                    ssh_title(&ssh_host)
                 } else {
                     pane.title.clone()
                 };
@@ -494,6 +502,15 @@ fn build_default_title(
     TitleText { items }
 }
 
+/// Nerd Font `md-ssh` glyph (present in the bundled SymbolsNerdFontMono),
+/// prefixed to remote host titles so remote tabs read differently from a
+/// local directory of the same name.
+const SSH_TITLE_GLYPH: char = '\u{f08c0}';
+
+fn ssh_title(host: &str) -> String {
+    format!("{} {}", SSH_TITLE_GLYPH, host)
+}
+
 /// Detect the SSH destination for a pane, used to show the remote host in tab titles.
 ///
 /// Fallback chain (first match wins):
@@ -510,7 +527,20 @@ fn ssh_destination_for_pane(pane: &PaneInformation) -> Option<String> {
 
     let mux = Mux::try_get()?;
     let real_pane = mux.get_pane(pane.pane_id)?;
+    ssh_destination_for_real_pane(&real_pane)
+}
 
+/// Same fallback chain as [`ssh_destination_for_pane`], for call sites that
+/// hold a mux pane rather than a `PaneInformation` (e.g. per-pane segments in
+/// split-tab titles).
+fn ssh_destination_for_real_pane(real_pane: &std::sync::Arc<dyn Pane>) -> Option<String> {
+    if let Some(command) = real_pane.copy_user_vars().get("WEZTERM_PROG") {
+        if let Some(host) = ssh_target_from_command(command) {
+            return Some(host);
+        }
+    }
+
+    let mux = Mux::try_get()?;
     if let Some(domain) = mux.get_domain(real_pane.domain_id()) {
         let name = domain.domain_name();
         if let Some(host) = name
@@ -522,7 +552,7 @@ fn ssh_destination_for_pane(pane: &PaneInformation) -> Option<String> {
     }
 
     let fg = real_pane.get_foreground_process_name(CachePolicy::AllowStale)?;
-    if command_basename(&fg) != "ssh" {
+    if !is_remote_shell_command(command_basename(&fg)) {
         return None;
     }
 
@@ -537,6 +567,13 @@ fn ssh_destination_for_pane(pane: &PaneInformation) -> Option<String> {
         .and_then(|cwd| cwd.host_str().map(ToString::to_string))
 }
 
+/// Remote-shell launchers whose first free argument is the destination host.
+/// `mosh-client` is excluded on purpose: its argv carries a resolved IP and a
+/// key, not the typed host, so it is only detectable via `WEZTERM_PROG`.
+fn is_remote_shell_command(basename: &str) -> bool {
+    matches!(basename, "ssh" | "mosh" | "autossh" | "et")
+}
+
 fn ssh_target_from_command(command: &str) -> Option<String> {
     let tokens = shlex::split(command).unwrap_or_else(|| {
         command
@@ -549,7 +586,11 @@ fn ssh_target_from_command(command: &str) -> Option<String> {
 }
 
 fn ssh_target_from_tokens(tokens: &[String]) -> Option<String> {
-    if tokens.is_empty() || command_basename(&tokens[0]) != "ssh" {
+    if tokens.is_empty() {
+        return None;
+    }
+    let program = command_basename(&tokens[0]);
+    if !is_remote_shell_command(program) {
         return None;
     }
 
@@ -563,7 +604,8 @@ fn ssh_target_from_tokens(tokens: &[String]) -> Option<String> {
             return None;
         }
         if token.starts_with('-') {
-            expect_value = ssh_option_needs_value(token);
+            // autossh's -M (monitor port) takes a value, unlike ssh's -M.
+            expect_value = ssh_option_needs_value(token) || (program == "autossh" && token == "-M");
             continue;
         }
         return normalize_ssh_target(token);
@@ -1479,6 +1521,26 @@ mod test {
     #[test]
     fn ignore_non_ssh_command() {
         assert!(ssh_target_from_command("ls -la").is_none());
+        assert!(ssh_target_from_command("ssh-keygen -t ed25519").is_none());
+    }
+
+    #[test]
+    fn parse_other_remote_shell_targets() {
+        assert_eq!(
+            ssh_target_from_command("mosh alice@edge.example").as_deref(),
+            Some("edge.example")
+        );
+        assert_eq!(
+            ssh_target_from_command("mosh --ssh=ssh -p 60001 edge").as_deref(),
+            Some("edge")
+        );
+        assert_eq!(
+            ssh_target_from_command("autossh -M 20000 build@ci-box").as_deref(),
+            Some("ci-box")
+        );
+        assert_eq!(ssh_target_from_command("et devbox:8080").as_deref(), {
+            Some("devbox")
+        });
     }
 
     #[test]

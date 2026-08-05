@@ -13,11 +13,11 @@ use mux::window::WindowId as MuxWindowId;
 use mux::{Mux, MuxNotification};
 use promise::{Future, Promise};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex};
 use wezterm_term::{Alert, ClipboardSelection};
 use wezterm_toast_notification::*;
 
@@ -135,16 +135,89 @@ pub(crate) fn kaku_cli_program_for_spawn() -> String {
     }
 }
 
+/// The bundled CLI as a single shell-quoted token, for typing into an
+/// interactive shell (menu actions). Spawn paths take the unquoted program
+/// via `kaku_cli_program_for_spawn` instead.
+pub(crate) fn kaku_cli_shell_invocation() -> String {
+    let kaku_bin = kaku_cli_program_for_spawn();
+    shell_quote_program(&kaku_bin)
+}
+
+fn shell_quote_program(program: &str) -> String {
+    shlex::try_quote(program)
+        .map(|q| q.into_owned())
+        .unwrap_or_else(|_| program.to_string())
+}
+
+struct SingletonState {
+    window_id: MuxWindowId,
+    pending: bool,
+}
+
+static SINGLETON_WINDOWS: LazyLock<Mutex<HashMap<&'static str, SingletonState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Open or focus a singleton window identified by `namespace`.
+/// If a window for the given namespace already exists, focus it.
+/// Otherwise, run `handler` to create one and track it by namespace.
+fn ensure_singleton_window<F, Fut>(namespace: &'static str, handler: F)
+where
+    F: FnOnce() -> Fut + 'static,
+    Fut: std::future::Future<Output = anyhow::Result<MuxWindowId>> + 'static,
+{
+    // Atomic check-and-mark: if window exists, focus and return;
+    // otherwise mark as pending to prevent duplicate spawns.
+    {
+        let mut guard = SINGLETON_WINDOWS.lock().unwrap();
+        if let Some(state) = guard.get(namespace) {
+            if state.pending {
+                return;
+            }
+            if Mux::get().get_window(state.window_id).is_some() {
+                if let Some(fe) = try_front_end() {
+                    if let Some(gw) = fe.gui_window_for_mux_window(state.window_id) {
+                        gw.window.focus();
+                        return;
+                    }
+                }
+            }
+        }
+        guard.insert(
+            namespace,
+            SingletonState {
+                window_id: 0,
+                pending: true,
+            },
+        );
+    }
+
+    promise::spawn::spawn(async move {
+        match handler().await {
+            Ok(window_id) => {
+                let mut guard = SINGLETON_WINDOWS.lock().unwrap();
+                if let Some(state) = guard.get_mut(namespace) {
+                    state.window_id = window_id;
+                    state.pending = false;
+                }
+            }
+            Err(err) => {
+                log::error!("singleton window '{namespace}' error: {:#}", err);
+                SINGLETON_WINDOWS.lock().unwrap().remove(namespace);
+            }
+        }
+    })
+    .detach();
+}
+
 pub fn open_kaku_config() {
     let kaku_bin = kaku_cli_program_for_spawn();
-
-    promise::spawn::spawn_into_main_thread(async move {
+    ensure_singleton_window("kaku-config", async move || {
         let config = fast_config_snapshot();
         let dpi = config.dpi.unwrap_or_else(|| ::window::default_dpi());
         let size = config.initial_size(dpi as u32, None);
         let term_config = Arc::new(config::TermConfig::with_config(config));
-        crate::spawn::spawn_command_impl(
-            &SpawnCommand {
+        crate::spawn::spawn_command_internal(
+            SpawnCommand {
                 domain: SpawnTabDomain::DomainName("local".to_string()),
                 args: Some(vec![kaku_bin, "config".to_string()]),
                 ..Default::default()
@@ -155,27 +228,54 @@ pub fn open_kaku_config() {
             size,
             None,
             term_config,
-        );
-    })
-    .detach();
+        )
+        .await
+    });
 }
 
+// Update entry matrix (every user-facing path must confirm before app replace):
+// - Toast click              -> confirm_and_apply_update (overlay)
+// - Menu Restart to Update  -> confirm_and_apply_update (overlay)
+// - Menu Check (staged)     -> confirm_and_apply_update (overlay)
+// - Menu Check (download)   -> run_kaku_update_in_tab(auto_confirm=false) -> CLI prompt
+// - Overlay confirmed       -> apply_update_now -> staged restart or tab(auto_confirm=true)
+// - CLI direct / brew       -> confirm_apply_update in kaku/src/update.rs
+// AUTO_CONFIRM is set only after overlay confirm, never for exploratory menu check.
+
+/// Menu "Check for Updates...". When a staged package is already ready, ask
+/// before restarting (same overlay as toast). Otherwise open a tab that runs
+/// `kaku update` interactively so the CLI can prompt before install.
+pub fn check_for_updates_from_menu() {
+    if crate::update::staged_update_available().is_some() {
+        confirm_and_apply_update();
+    } else {
+        run_kaku_update_in_tab(/* auto_confirm */ false);
+    }
+}
+
+/// Open a terminal tab running `kaku update` without pre-confirming install.
+/// Used by the menu check path and by staged-update failure fallbacks.
 pub fn run_kaku_update_from_menu() {
+    run_kaku_update_in_tab(/* auto_confirm */ false);
+}
+
+fn run_kaku_update_in_tab(auto_confirm: bool) {
     static UPDATE_RUNNING: AtomicBool = AtomicBool::new(false);
     if UPDATE_RUNNING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
     {
-        log::info!("run_kaku_update_from_menu: update already running, ignoring");
+        log::info!("run_kaku_update_in_tab: update already running, ignoring");
         return;
     }
-    run_kaku_subcommand_in_new_tab("update", Some(&UPDATE_RUNNING));
+    run_kaku_subcommand_in_new_tab("update", Some(&UPDATE_RUNNING), auto_confirm);
 }
 
-/// Entry point for the update toast click. Routes to the front GUI window and
-/// shows a confirmation overlay before anything destructive happens, so a
-/// stray click can no longer kill running tasks. Falls back to applying
-/// directly only when there is no GUI window to host the overlay.
+/// Entry point for toast click and menu "Restart to Update". Routes to the
+/// front GUI window and shows a confirmation overlay before anything
+/// destructive happens, so a stray click can no longer kill running tasks.
+/// Falls back to applying directly only when there is no GUI window to host
+/// the overlay.
 pub fn confirm_and_apply_update() {
     promise::spawn::spawn_into_main_thread(async move {
         if let Some(fe) = try_front_end() {
@@ -193,12 +293,13 @@ pub fn confirm_and_apply_update() {
 
 /// Apply the pending update now. Called only after the user confirms in the
 /// update overlay (or as a fallback when no window can host the overlay).
-/// Uses the staged fast-path when available, else the terminal-tab flow.
+/// Uses the staged fast-path when available, else the terminal-tab flow with
+/// auto-confirm (user already approved the restart in the overlay).
 pub(crate) fn apply_update_now() {
     if crate::update::staged_update_available().is_some() {
         restart_to_update();
     } else {
-        run_kaku_update_from_menu();
+        run_kaku_update_in_tab(/* auto_confirm */ true);
     }
 }
 
@@ -297,10 +398,14 @@ pub fn restart_to_update() {
 }
 
 pub fn run_kaku_doctor_in_new_tab() {
-    run_kaku_subcommand_in_new_tab("doctor", None);
+    run_kaku_subcommand_in_new_tab("doctor", None, false);
 }
 
-fn run_kaku_subcommand_in_new_tab(subcommand: &str, running_flag: Option<&'static AtomicBool>) {
+fn run_kaku_subcommand_in_new_tab(
+    subcommand: &str,
+    running_flag: Option<&'static AtomicBool>,
+    auto_confirm: bool,
+) {
     let subcommand = subcommand.to_string();
     let kaku_bin = kaku_cli_program_for_spawn();
     let fallback_bin = shlex::try_quote(&kaku_bin)
@@ -319,9 +424,10 @@ fn run_kaku_subcommand_in_new_tab(subcommand: &str, running_flag: Option<&'stati
     // environment) is inherited and ~/.zprofile is never loaded, so curl hits
     // api.github.com without a proxy -- causing 30+ second timeouts on Chinese
     // networks. The extra few hundred ms of profile loading is negligible.
-    // When launched from the GUI for `update`, set KAKU_UPDATE_AUTO_CONFIRM=1
-    // so the CLI skips the interactive "Press Enter" confirmation.
-    let env_prefix = if subcommand == "update" {
+    // Only set KAKU_UPDATE_AUTO_CONFIRM after the user already confirmed in the
+    // GUI overlay. Menu "Check for Updates" leaves this unset so the CLI still
+    // prompts before replacing the app and quitting.
+    let env_prefix = if subcommand == "update" && auto_confirm {
         "KAKU_UPDATE_AUTO_CONFIRM=1 "
     } else {
         ""
@@ -913,7 +1019,10 @@ impl GuiFrontEnd {
                     KeyAssignment::EmitEvent(event)
                         if event == "update-kaku" || event == "run-kaku-update" =>
                     {
-                        run_kaku_update_from_menu();
+                        check_for_updates_from_menu();
+                    }
+                    KeyAssignment::EmitEvent(event) if event == "restart-to-update" => {
+                        confirm_and_apply_update();
                     }
                     KeyAssignment::EmitEvent(event) if event == "run-kaku-cli" => {
                         let kaku_cli = kaku_cli_program_for_spawn();
@@ -1287,4 +1396,76 @@ pub fn try_new() -> Result<Rc<GuiFrontEnd>, Error> {
         .replace(config_subscription);
 
     Ok(front_end)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_quote_program;
+
+    #[test]
+    fn shell_program_with_spaces_round_trips_as_one_token() {
+        let program = "/Applications/Kaku Nightly.app/Contents/MacOS/kaku";
+        let quoted = shell_quote_program(program);
+        assert_eq!(shlex::split(&quoted), Some(vec![program.to_string()]));
+    }
+
+    /// User-facing update events must not call `restart_to_update` directly.
+    /// Regression for toast-only confirm (d9e8500e) + menu sibling (06cbdc00).
+    #[test]
+    fn user_facing_update_events_route_through_confirm() {
+        let termwindow = include_str!("termwindow/mod.rs");
+        let frontend = include_str!("frontend.rs");
+        let update = include_str!("update.rs");
+
+        // Window-scoped EmitEvent handlers.
+        assert!(
+            termwindow.contains("check_for_updates_from_menu()"),
+            "run-kaku-update must go through check_for_updates_from_menu"
+        );
+        assert!(
+            termwindow.contains("confirm_and_apply_update()"),
+            "restart-to-update must go through confirm_and_apply_update"
+        );
+        // Direct restart from the event arm is the original bug.
+        let restart_arm = termwindow
+            .split("name == \"restart-to-update\"")
+            .nth(1)
+            .expect("restart-to-update arm");
+        let restart_body = restart_arm.split("} else if name ==").next().unwrap();
+        assert!(
+            restart_body.contains("confirm_and_apply_update()"),
+            "restart-to-update arm must confirm"
+        );
+        assert!(
+            !restart_body.contains("restart_to_update()"),
+            "restart-to-update arm must not call restart_to_update directly"
+        );
+
+        // Menubar path when no window has focus.
+        assert!(
+            frontend.contains("check_for_updates_from_menu()"),
+            "menubar run-kaku-update must confirm-or-prompt"
+        );
+        let fe_restart = frontend
+            .split("event == \"restart-to-update\"")
+            .nth(1)
+            .expect("frontend restart-to-update arm");
+        let fe_restart_body = fe_restart.split("KeyAssignment::EmitEvent").next().unwrap();
+        assert!(
+            fe_restart_body.contains("confirm_and_apply_update()"),
+            "frontend restart-to-update must confirm"
+        );
+
+        // Toast click callback.
+        assert!(
+            update.contains("confirm_and_apply_update()"),
+            "toast update click must confirm"
+        );
+
+        // AUTO_CONFIRM only when auto_confirm is true (post-overlay).
+        assert!(
+            frontend.contains("if subcommand == \"update\" && auto_confirm"),
+            "AUTO_CONFIRM must require auto_confirm flag, not every update tab"
+        );
+    }
 }

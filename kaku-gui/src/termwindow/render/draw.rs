@@ -254,9 +254,26 @@ impl crate::TermWindow {
                     uniforms.add_struct("blink", &blink);
                     uniforms.add_struct("rapid_blink", &rapid_blink);
 
+                    let vertex_slice =
+                        vertices.glium().slice(0..vertex_count).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "vertex buffer slice 0..{} is out of range for layer {}",
+                                vertex_count,
+                                idx
+                            )
+                        })?;
+                    let index_slice =
+                        vb.indices.glium().slice(0..index_count).ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "index buffer slice 0..{} is out of range for layer {}",
+                                index_count,
+                                idx
+                            )
+                        })?;
+
                     frame.draw(
-                        vertices.glium().slice(0..vertex_count).unwrap(),
-                        vb.indices.glium().slice(0..index_count).unwrap(),
+                        vertex_slice,
+                        index_slice,
                         gl_state.glyph_prog.as_ref().unwrap(),
                         &uniforms,
                         if subpixel_aa {

@@ -483,6 +483,16 @@ impl FallbackResolveInfo {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn with_fallback_autorelease_pool<T>(f: impl FnOnce() -> T) -> T {
+    objc::rc::autoreleasepool(f)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn with_fallback_autorelease_pool<T>(f: impl FnOnce() -> T) -> T {
+    f()
+}
+
 #[derive(PartialEq, Eq)]
 enum Entity {
     Title,
@@ -575,7 +585,7 @@ impl FontConfigInner {
 
             std::thread::spawn(move || {
                 for info in rx {
-                    info.process();
+                    with_fallback_autorelease_pool(|| info.process());
                 }
             });
 
@@ -1165,5 +1175,30 @@ impl FontConfiguration {
         attrs: &CellAttributes,
     ) -> &'a TextStyle {
         self.inner.match_style(config, attrs)
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod macos_tests {
+    use super::with_fallback_autorelease_pool;
+    use objc::rc::{autoreleasepool, StrongPtr};
+    use objc::{class, msg_send, sel, sel_impl};
+
+    #[test]
+    fn fallback_jobs_drain_autoreleased_objects() {
+        autoreleasepool(|| {
+            let object = unsafe { StrongPtr::new(msg_send![class!(NSObject), new]) };
+            let weak = object.weak();
+
+            with_fallback_autorelease_pool(|| {
+                object.autorelease();
+            });
+
+            let loaded = weak.load();
+            assert!(
+                (*loaded).is_null(),
+                "fallback job left an autoreleased object pending"
+            );
+        });
     }
 }

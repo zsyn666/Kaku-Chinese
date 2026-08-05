@@ -23,19 +23,3 @@ The key regression guard is `update_titlebar_background()` in
 `window/src/os/macos/window.rs`: native titlebar coloring must remain opt-in for
 opaque windows, otherwise `NSTitlebarContainerView` can cover the Metal-rendered
 top tab bar.
-
-## 0.10.0 Issue Triage
-
-- #334 cursor disappears: the report only says the cursor sometimes disappears,
-  with no repro steps. First split the investigation between the macOS mouse
-  pointer path (`hide_mouse_cursor_when_typing` in
-  `kaku-gui/src/termwindow/keyevent.rs`) and the terminal text cursor path
-  (`kaku-gui/src/termwindow/render/pane.rs` and
-  `kaku-gui/src/termwindow/render/screen_line.rs`). Do not block 0.10.0 without
-  a reproducible terminal cursor failure.
-- #329 copy/paste over SSH to a remote Mac mini: the report does not specify
-  whether it uses plain `/usr/bin/ssh`, Kaku remote domains, OSC 52, selection
-  copy, or bracketed paste. Plain SSH should still use the local pane clipboard
-  path; remote-domain issues should be checked through `mux/src/ssh.rs` plus
-  OSC 52 handling in `term/src/terminalstate/performer.rs`. Do not block 0.10.0
-  until the failing path is identified.

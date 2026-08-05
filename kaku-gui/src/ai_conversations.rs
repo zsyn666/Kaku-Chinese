@@ -36,6 +36,10 @@ pub struct PersistedMessage {
     /// DeepSeek-compatible `reasoning_content`. Kept out of visible content.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reasoning_content: String,
+    /// Stateless Responses input items for this assistant turn, including
+    /// encrypted reasoning, function calls, and their outputs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub responses_items: Vec<serde_json::Value>,
     #[serde(default)]
     pub attachments: Vec<PersistedAttachment>,
     /// Sequential index of the user/assistant exchange pair this message belongs to.
@@ -594,6 +598,7 @@ mod tests {
             role: "user".to_string(),
             content: "<think>\nkeep\n</think>\n\nliteral".to_string(),
             reasoning_content: String::new(),
+            responses_items: vec![],
             attachments: vec![],
             round_id: 0,
         };
@@ -624,6 +629,7 @@ mod tests {
             role: "assistant".to_string(),
             content: "<think>\nduplicate\n</think>\n\nVisible".to_string(),
             reasoning_content: "hidden".to_string(),
+            responses_items: vec![],
             attachments: vec![],
             round_id: 0,
         };
@@ -641,6 +647,7 @@ mod tests {
                 role: "user".to_string(),
                 content: "question".to_string(),
                 reasoning_content: String::new(),
+                responses_items: vec![],
                 attachments: vec![PersistedAttachment {
                     kind: "cwd".to_string(),
                     label: "@cwd".to_string(),
@@ -655,5 +662,30 @@ mod tests {
         assert_eq!(parsed.messages[0].attachments.len(), 1);
         assert_eq!(parsed.messages[0].attachments[0].label, "@cwd");
         assert_eq!(parsed.messages[0].attachments[0].payload, "Directory: /tmp");
+    }
+
+    #[test]
+    fn conversation_file_round_trip_preserves_responses_state() {
+        let reasoning = serde_json::json!({
+            "id": "reasoning_1",
+            "type": "reasoning",
+            "encrypted_content": "opaque"
+        });
+        let file = ConversationFile {
+            version: 1,
+            summary: "summary".to_string(),
+            messages: vec![PersistedMessage {
+                role: "assistant".to_string(),
+                content: "answer".to_string(),
+                reasoning_content: String::new(),
+                responses_items: vec![reasoning.clone()],
+                attachments: vec![],
+                round_id: 0,
+            }],
+        };
+
+        let json = serde_json::to_string(&file).unwrap();
+        let parsed: ConversationFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.messages[0].responses_items, vec![reasoning]);
     }
 }

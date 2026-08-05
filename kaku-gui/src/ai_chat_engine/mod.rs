@@ -16,7 +16,7 @@ pub(crate) mod title;
 /// Hard cap on conversation titles stored in the index and shown in `/resume`.
 pub(crate) const TITLE_MAX_CHARS: usize = 40;
 
-use crate::ai_client::{should_roundtrip_reasoning_content, AiClient, ApiMessage};
+use crate::ai_client::{should_roundtrip_reasoning_content, AiClient, ApiMessage, ApiMode};
 use crate::ai_conversations::{self, PersistedMessage};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
@@ -31,6 +31,9 @@ pub enum StreamMsg {
     Token(String),
     /// Hidden provider reasoning, stored separately from visible assistant text.
     Reasoning(String),
+    /// Stateless Responses transcript needed to continue this assistant turn
+    /// across the next user message without losing encrypted reasoning state.
+    ResponsesState(Vec<serde_json::Value>),
     ToolStart {
         name: String,
         args_preview: String,
@@ -119,6 +122,10 @@ pub(crate) fn strip_prompt_metadata(s: &str) -> &str {
 #[derive(Default)]
 pub(crate) struct EnvironmentInputs<'a> {
     pub cwd: &'a str,
+    /// Remote host owning `cwd` when the pane is inside an ssh session.
+    /// The overlay disables local tools in that case; this line tells the
+    /// model why and keeps it from suggesting local file operations.
+    pub remote_host: Option<&'a str>,
     /// Visible terminal panel width / height in cells. `None` omits the line.
     /// Overlay supplies these; the `k` CLI does not have a comparable concept.
     pub panel_cols: Option<usize>,
@@ -162,6 +169,15 @@ pub(crate) fn build_environment_message(input: &EnvironmentInputs<'_>) -> ApiMes
 
     if !input.cwd.is_empty() {
         s.push_str(&format!("Current directory: {}\n", input.cwd));
+    }
+    if let Some(host) = input.remote_host {
+        s.push_str(&format!(
+            "Remote session: the terminal is connected to `{}` over ssh, and the \
+             current directory is on that host. Local shell and file tools are \
+             disabled; answer from context and suggest commands the user can run \
+             in the remote terminal instead.\n",
+            host
+        ));
     }
 
     if input.include_project_hints && !input.cwd.is_empty() {
@@ -319,6 +335,54 @@ pub(crate) const MAX_AGENT_ROUNDS: usize = 25;
 /// Soft warning threshold inside the agent loop; `MAX_AGENT_ROUNDS - 5`.
 const SOFT_ROUND_WARN: usize = MAX_AGENT_ROUNDS - 5;
 const MAX_HISTORY_BYTES: usize = 120_000;
+const MAX_RESPONSES_STATE_BYTES: usize = MAX_HISTORY_BYTES;
+/// Ceiling for text + reasoning streamed to the UI across one user turn
+/// (all tool rounds). Verbose reasoning models burn tens of KB per round,
+/// so this is deliberately larger than the history budget. Hitting it is an
+/// explicit partial-turn error: unseen tool calls must never be reported as a
+/// successful completion.
+const MAX_STREAMED_OUTPUT_BYTES: usize = 4 * MAX_HISTORY_BYTES;
+
+fn reserve_streamed_output(total: &std::cell::Cell<usize>, chunk_bytes: usize) -> bool {
+    let Some(next) = total.get().checked_add(chunk_bytes) else {
+        return false;
+    };
+    if next > MAX_STREAMED_OUTPUT_BYTES {
+        return false;
+    }
+    total.set(next);
+    true
+}
+
+fn send_streamed_output_limit(tx: &Sender<StreamMsg>, sent_start: bool) {
+    if !sent_start {
+        let _ = tx.send(StreamMsg::AssistantStart);
+    }
+    let _ = tx.send(StreamMsg::Err(format!(
+        "output truncated after {} streamed bytes; the turn is partial and no remaining tool calls were executed",
+        MAX_STREAMED_OUTPUT_BYTES
+    )));
+}
+
+fn compact_and_validate_responses_state(
+    items: &mut [serde_json::Value],
+    round: usize,
+) -> anyhow::Result<()> {
+    compact::micro_compact_response_items(items, round);
+    let bytes = items.iter().try_fold(0usize, |total, item| {
+        let item_bytes = serde_json::to_vec(item)?.len();
+        total
+            .checked_add(item_bytes)
+            .ok_or_else(|| anyhow::anyhow!("Responses transcript size overflowed"))
+    })?;
+    if bytes > MAX_RESPONSES_STATE_BYTES {
+        anyhow::bail!(
+            "Responses transcript exceeded {} bytes",
+            MAX_RESPONSES_STATE_BYTES
+        );
+    }
+    Ok(())
+}
 
 #[allow(clippy::too_many_arguments)] // grandfathered; bundling into a struct
                                      // is tracked separately.
@@ -345,6 +409,12 @@ pub(crate) fn run_agent(
         .map(|d| d.join(&conv_id).join("tool_outputs"));
 
     let mut summarize_cooldown: usize = 0;
+    let responses_mode = client.config().effective_api_mode() == ApiMode::Responses;
+    let mut responses_state = ResponsesTranscript::default();
+    // Bound the entire user turn before chunks reach the overlay, where each
+    // grapheme is queued separately for paced rendering.
+    let streamed_output_bytes = std::cell::Cell::new(0usize);
+    let streamed_output_exceeded = std::cell::Cell::new(false);
 
     for round in 0..MAX_ROUNDS {
         if cancel.load(Ordering::Relaxed) {
@@ -395,12 +465,17 @@ pub(crate) fn run_agent(
         let tx_r = tx.clone();
         let sent_start = std::cell::Cell::new(false);
         let mut reasoning_buf = String::new();
-        let tool_calls = match client.chat_step(
+        let step = match client.chat_step(
             &model,
             &messages,
             &tools,
+            true,
             &cancel,
             &mut |token| {
+                if !reserve_streamed_output(&streamed_output_bytes, token.len()) {
+                    streamed_output_exceeded.set(true);
+                    return;
+                }
                 if !sent_start.get() {
                     let _ = tx_c.send(StreamMsg::AssistantStart);
                     sent_start.set(true);
@@ -408,6 +483,10 @@ pub(crate) fn run_agent(
                 let _ = tx_c.send(StreamMsg::Token(token.to_string()));
             },
             &mut |reasoning| {
+                if !reserve_streamed_output(&streamed_output_bytes, reasoning.len()) {
+                    streamed_output_exceeded.set(true);
+                    return;
+                }
                 if !sent_start.get() {
                     let _ = tx_r.send(StreamMsg::AssistantStart);
                     sent_start.set(true);
@@ -416,52 +495,124 @@ pub(crate) fn run_agent(
                 let _ = tx_r.send(StreamMsg::Reasoning(reasoning.to_string()));
             },
         ) {
-            Ok(tc) => tc,
+            Ok(step) => step,
             Err(e) => {
                 let _ = tx.send(StreamMsg::Err(e.to_string()));
                 return;
             }
         };
+        if streamed_output_exceeded.get() {
+            // The provider may have returned tool calls after the visible
+            // text. Fail the turn explicitly so the UI cannot announce
+            // success or run completion-only memory work for a partial turn.
+            send_streamed_output_limit(&tx, sent_start.get());
+            return;
+        }
 
-        if tool_calls.is_empty() {
+        let response_items = step.response_items;
+        if responses_mode {
+            responses_state.absorb(&response_items, round);
+        }
+
+        if step.tool_calls.is_empty() {
+            if let Some(items) = responses_state.take_for_persistence() {
+                let _ = tx.send(StreamMsg::ResponsesState(items));
+            }
             let _ = tx.send(StreamMsg::Done);
             return;
         }
 
-        let tc_json: Vec<serde_json::Value> = tool_calls
-            .iter()
-            .map(|tc| {
-                serde_json::json!({
-                    "id": tc.id,
-                    "type": "function",
-                    "function": { "name": tc.name, "arguments": tc.arguments }
+        let allowed_tools = advertised_tool_names(&tools);
+
+        let tool_calls = step.tool_calls;
+
+        if response_items.is_empty() {
+            let tc_json: Vec<serde_json::Value> = tool_calls
+                .iter()
+                .map(|tc| {
+                    serde_json::json!({
+                        "id": tc.id,
+                        "type": "function",
+                        "function": { "name": tc.name, "arguments": tc.arguments }
+                    })
                 })
-            })
-            .collect();
-        let mut assistant_msg = ApiMessage::assistant_tool_calls(serde_json::Value::Array(tc_json));
-        if should_roundtrip_reasoning_content(&model) && !reasoning_buf.is_empty() {
-            assistant_msg.0["reasoning_content"] = serde_json::Value::String(reasoning_buf);
+                .collect();
+            let mut assistant_msg =
+                ApiMessage::assistant_tool_calls(serde_json::Value::Array(tc_json));
+            if should_roundtrip_reasoning_content(&model) && !reasoning_buf.is_empty() {
+                assistant_msg.0["reasoning_content"] = serde_json::Value::String(reasoning_buf);
+            }
+            messages.push(assistant_msg);
+        } else {
+            messages.extend(
+                response_items
+                    .into_iter()
+                    .map(ApiMessage::responses_output_item),
+            );
         }
-        messages.push(assistant_msg);
 
         for tc in &tool_calls {
             if cancel.load(Ordering::Relaxed) {
                 break;
             }
 
-            let args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
+            // Never execute a tool that was not advertised this round, but
+            // answer with an error tool_result instead of killing the turn:
+            // models imitate replayed history (e.g. a third-party
+            // `web_search` call recorded before native search was enabled)
+            // and self-correct on the error.
+            if !allowed_tools.contains(tc.name.as_str()) {
+                let err = format!(
+                    "tool '{}' is not available; use only the currently advertised tools",
+                    tc.name
+                );
+                let _ = tx.send(StreamMsg::ToolFailed { error: err.clone() });
+                record_tool_result(
+                    &mut messages,
+                    &mut responses_state,
+                    responses_mode,
+                    round,
+                    tc.id.clone(),
+                    tc.name.clone(),
+                    format!("Error: {}", err),
+                );
+                continue;
+            }
+
+            let mut args: serde_json::Value = match serde_json::from_str(&tc.arguments) {
                 Ok(v) => v,
                 Err(e) => {
                     let err = format!("tool '{}' arguments were not valid JSON: {}", tc.name, e);
                     let _ = tx.send(StreamMsg::ToolFailed { error: err.clone() });
-                    messages.push(ApiMessage::tool_result(
+                    record_tool_result(
+                        &mut messages,
+                        &mut responses_state,
+                        responses_mode,
+                        round,
                         tc.id.clone(),
                         tc.name.clone(),
                         format!("Error: {}", err),
-                    ));
+                    );
                     continue;
                 }
             };
+
+            if tc.name == "fs_read" {
+                if let Err(error) = crate::ai_tools::paths::pin_read_arg(&mut args, &cwd) {
+                    let err = error.to_string();
+                    let _ = tx.send(StreamMsg::ToolFailed { error: err.clone() });
+                    record_tool_result(
+                        &mut messages,
+                        &mut responses_state,
+                        responses_mode,
+                        round,
+                        tc.id.clone(),
+                        tc.name.clone(),
+                        format!("Error: {}", err),
+                    );
+                    continue;
+                }
+            }
 
             let args_preview = args
                 .get("query")
@@ -474,7 +625,7 @@ pub(crate) fn run_agent(
                 .map(|s| middle_truncate(s, 80))
                 .unwrap_or_default();
 
-            if let Some(summary) = approval::approval_summary(&tc.name, &args) {
+            if let Some(summary) = approval::approval_summary_in_cwd(&tc.name, &args, &cwd) {
                 const APPROVAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
                 let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<bool>(0);
                 let _ = tx.send(StreamMsg::ApprovalRequired { summary, reply_tx });
@@ -491,11 +642,15 @@ pub(crate) fn run_agent(
                     let _ = tx.send(StreamMsg::ToolFailed {
                         error: "Operation rejected by user.".into(),
                     });
-                    messages.push(ApiMessage::tool_result(
+                    record_tool_result(
+                        &mut messages,
+                        &mut responses_state,
+                        responses_mode,
+                        round,
                         tc.id.clone(),
                         tc.name.clone(),
                         "Error: user rejected the operation.".to_string(),
-                    ));
+                    );
                     continue;
                 }
             }
@@ -511,22 +666,30 @@ pub(crate) fn run_agent(
                     let _ = tx.send(StreamMsg::ToolDone {
                         result_preview: preview,
                     });
-                    messages.push(ApiMessage::tool_result(
+                    record_tool_result(
+                        &mut messages,
+                        &mut responses_state,
+                        responses_mode,
+                        round,
                         tc.id.clone(),
                         tc.name.clone(),
                         result,
-                    ));
+                    );
                 }
                 Err(e) => {
                     let err_str = e.to_string();
                     let _ = tx.send(StreamMsg::ToolFailed {
                         error: err_str.clone(),
                     });
-                    messages.push(ApiMessage::tool_result(
+                    record_tool_result(
+                        &mut messages,
+                        &mut responses_state,
+                        responses_mode,
+                        round,
                         tc.id.clone(),
                         tc.name.clone(),
                         format!("Error: {}", err_str),
-                    ));
+                    );
                 }
             }
         }
@@ -538,6 +701,88 @@ pub(crate) fn run_agent(
             .to_string(),
     ));
     let _ = tx.send(StreamMsg::Done);
+}
+
+/// Names the model may call this round. Anything outside this set is answered
+/// with an error tool_result (never executed, never a turn-kill).
+fn advertised_tool_names(
+    advertised_tools: &[serde_json::Value],
+) -> std::collections::HashSet<String> {
+    advertised_tools
+        .iter()
+        .filter_map(|tool| tool["function"]["name"].as_str())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Raw Responses-API items accumulated across one user turn for persistence.
+///
+/// When the compacted transcript still exceeds its byte budget, the whole
+/// transcript is dropped for this turn (the next turn replays plain text,
+/// exactly like the mid-turn error paths) instead of killing a turn whose
+/// tool work already happened. Once dropped it stays dropped: a partial
+/// transcript would replay protocol-inconsistent state.
+#[derive(Default)]
+struct ResponsesTranscript {
+    items: Vec<serde_json::Value>,
+    dropped: bool,
+}
+
+impl ResponsesTranscript {
+    fn absorb(&mut self, new_items: &[serde_json::Value], round: usize) {
+        if self.dropped {
+            return;
+        }
+        self.items.extend(new_items.iter().cloned());
+        self.compact_or_drop(round);
+    }
+
+    fn push_tool_output(&mut self, call_id: &str, output: &str, round: usize) {
+        if self.dropped {
+            return;
+        }
+        self.items.push(serde_json::json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output,
+        }));
+        self.compact_or_drop(round);
+    }
+
+    fn compact_or_drop(&mut self, round: usize) {
+        if let Err(error) = compact_and_validate_responses_state(&mut self.items, round) {
+            log::warn!("dropping responses transcript for this turn: {error}");
+            self.items.clear();
+            self.dropped = true;
+        }
+    }
+
+    fn take_for_persistence(self) -> Option<Vec<serde_json::Value>> {
+        if self.dropped || self.items.is_empty() {
+            None
+        } else {
+            Some(self.items)
+        }
+    }
+}
+
+fn record_tool_result(
+    messages: &mut Vec<ApiMessage>,
+    responses_state: &mut ResponsesTranscript,
+    responses_mode: bool,
+    round: usize,
+    call_id: String,
+    name: String,
+    content: String,
+) {
+    messages.push(ApiMessage::tool_result(
+        call_id.clone(),
+        name,
+        content.clone(),
+    ));
+    if responses_mode {
+        responses_state.push_tool_output(&call_id, &content, round);
+    }
 }
 
 // ── Summary generation ────────────────────────────────────────────────────────
@@ -749,6 +994,7 @@ impl Engine {
             role: "user".to_string(),
             content: user_input.clone(),
             reasoning_content: String::new(),
+            responses_items: vec![],
             attachments: vec![],
             round_id,
         });
@@ -785,11 +1031,21 @@ impl Engine {
 
     /// Record the completed assistant response and persist the conversation.
     pub fn record_assistant_with_reasoning(&mut self, content: String, reasoning_content: String) {
+        self.record_assistant_with_state(content, reasoning_content, vec![]);
+    }
+
+    pub fn record_assistant_with_state(
+        &mut self,
+        content: String,
+        reasoning_content: String,
+        responses_items: Vec<serde_json::Value>,
+    ) {
         let round_id = self.last_round_id();
         self.messages.push(PersistedMessage {
             role: "assistant".to_string(),
             content,
             reasoning_content,
+            responses_items,
             attachments: vec![],
             round_id,
         });
@@ -843,7 +1099,16 @@ impl Engine {
             match msg.role.as_str() {
                 "user" => out.push(ApiMessage::user(&msg.content)),
                 "assistant" => {
-                    if should_roundtrip_reasoning_content(&self.model) {
+                    if self.client.config().effective_api_mode() == ApiMode::Responses
+                        && !msg.responses_items.is_empty()
+                    {
+                        out.extend(
+                            msg.responses_items
+                                .iter()
+                                .cloned()
+                                .map(ApiMessage::responses_output_item),
+                        );
+                    } else if should_roundtrip_reasoning_content(&self.model) {
                         out.push(ApiMessage::assistant_with_reasoning(
                             &msg.content,
                             &msg.reasoning_content,
@@ -874,9 +1139,85 @@ impl Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai_client::AssistantConfig;
+    use crate::ai_client::{ApiMode, AssistantConfig, ToolCall};
+
+    #[test]
+    fn unadvertised_tool_calls_are_outside_the_allowed_set() {
+        let calls = [ToolCall {
+            id: "call-1".to_string(),
+            name: "fs_delete".to_string(),
+            arguments: "{}".to_string(),
+        }];
+        let advertised = vec![serde_json::json!({
+            "type": "function",
+            "function": { "name": "pwd" }
+        })];
+
+        let allowed = advertised_tool_names(&advertised);
+        assert!(allowed.contains("pwd"));
+        assert!(!allowed.contains(calls[0].name.as_str()));
+        assert!(advertised_tool_names(&[]).is_empty());
+    }
+
+    #[test]
+    fn responses_transcript_rejects_uncompactable_oversized_state() {
+        let mut items = vec![serde_json::json!({
+            "type": "reasoning",
+            "encrypted_content": "x".repeat(MAX_RESPONSES_STATE_BYTES + 1),
+        })];
+        let error = compact_and_validate_responses_state(&mut items, 0)
+            .expect_err("oversized raw protocol state must not accumulate or persist");
+        assert!(error.to_string().contains("exceeded"));
+    }
+
+    #[test]
+    fn streamed_output_budget_is_cumulative_and_fail_closed() {
+        let total = std::cell::Cell::new(MAX_STREAMED_OUTPUT_BYTES - 2);
+        assert!(reserve_streamed_output(&total, 2));
+        assert!(!reserve_streamed_output(&total, 1));
+        assert_eq!(total.get(), MAX_STREAMED_OUTPUT_BYTES);
+        assert!(!reserve_streamed_output(&total, usize::MAX));
+    }
+
+    #[test]
+    fn streamed_output_limit_is_an_error_not_success() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        send_streamed_output_limit(&tx, false);
+        assert!(matches!(rx.recv().unwrap(), StreamMsg::AssistantStart));
+        assert!(
+            matches!(rx.recv().unwrap(), StreamMsg::Err(message) if message.contains("truncated"))
+        );
+        assert!(rx.try_recv().is_err(), "truncation must not also emit Done");
+    }
+
+    #[test]
+    fn responses_transcript_compacts_tool_outputs_before_budgeting() {
+        let mut items = vec![
+            serde_json::json!({
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "fs_read",
+                "arguments": "{}",
+            }),
+            serde_json::json!({
+                "type": "function_call_output",
+                "call_id": "call_1",
+                "output": "x".repeat(MAX_RESPONSES_STATE_BYTES),
+            }),
+        ];
+
+        compact_and_validate_responses_state(&mut items, 0).unwrap();
+        assert!(items[1]["output"]
+            .as_str()
+            .unwrap()
+            .contains("bytes elided"));
+    }
 
     fn test_client() -> AiClient {
+        test_client_with_mode(ApiMode::ChatCompletions)
+    }
+
+    fn test_client_with_mode(api_mode: ApiMode) -> AiClient {
         AiClient::new(AssistantConfig {
             api_key: "test-key".to_string(),
             chat_model: "deepseek-v4-pro".to_string(),
@@ -884,8 +1225,10 @@ mod tests {
             base_url: "https://example.com/v1".to_string(),
             custom_headers: vec![],
             provider: "Custom".to_string(),
+            api_mode,
             auth_type: "api_key".to_string(),
             chat_tools_enabled: true,
+            native_web_search: false,
             web_search_provider: None,
             web_search_api_key: None,
             web_fetch_script: None,
@@ -965,6 +1308,7 @@ mod tests {
             role: "user".to_string(),
             content: "hello".to_string(),
             reasoning_content: String::new(),
+            responses_items: vec![],
             attachments: vec![],
             round_id: 0,
         });
@@ -987,6 +1331,7 @@ mod tests {
             role: "user".to_string(),
             content: "hello".to_string(),
             reasoning_content: String::new(),
+            responses_items: vec![],
             attachments: vec![],
             round_id: 0,
         });
@@ -1000,6 +1345,38 @@ mod tests {
             .unwrap();
         assert_eq!(assistant.0["content"], "visible");
         assert!(assistant.0.get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn build_api_messages_replays_persisted_responses_state() {
+        let mut engine = test_engine("gpt-5.4");
+        engine.client = test_client_with_mode(ApiMode::Responses);
+        engine.messages.push(PersistedMessage {
+            role: "user".to_string(),
+            content: "inspect".to_string(),
+            reasoning_content: String::new(),
+            responses_items: vec![],
+            attachments: vec![],
+            round_id: 0,
+        });
+        let reasoning = serde_json::json!({
+            "id": "reasoning_1",
+            "type": "reasoning",
+            "encrypted_content": "opaque"
+        });
+        engine.record_assistant_with_state(
+            "done".to_string(),
+            String::new(),
+            vec![reasoning.clone()],
+        );
+
+        let messages = engine.build_api_messages();
+        assert!(messages
+            .iter()
+            .any(|message| { message.0.get("kaku_responses_output_item") == Some(&reasoning) }));
+        assert!(!messages
+            .iter()
+            .any(|message| { message.0["role"] == "assistant" && message.0["content"] == "done" }));
     }
 
     #[test]

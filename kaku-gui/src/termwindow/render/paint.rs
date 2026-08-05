@@ -115,17 +115,28 @@ impl crate::TermWindow {
         // Limit retries to prevent a busy-loop when render state cannot converge
         // (e.g. during display reconfiguration after lock-screen return).
         const MAX_PAINT_RETRIES: usize = 8;
+        // Set while the most recent pass had to grow the quad buffers: the
+        // vertices staged by that pass were truncated to the old capacity,
+        // so the frame we are about to draw is incomplete.
+        let mut quads_grew = false;
         'pass: for pass in 0..MAX_PAINT_RETRIES {
             match self.paint_pass() {
                 Ok(_) => match self.render_state.as_mut().unwrap().allocated_more_quads() {
                     Ok(allocated) => {
                         if !allocated {
+                            quads_grew = false;
                             break 'pass;
                         }
+                        quads_grew = true;
                         self.invalidate_fancy_tab_bar();
                         self.invalidate_modal();
                     }
                     Err(err) => {
+                        // The grow failed (allocation), so capacity is
+                        // unchanged and a forced repaint would fail the same
+                        // way every frame. Draw the clamped frame and stop:
+                        // do not request another pass.
+                        quads_grew = false;
                         log::error!("{:#}", err);
                         break 'pass;
                     }
@@ -191,6 +202,21 @@ impl crate::TermWindow {
                 200,
                 start.elapsed().as_millis()
             );
+        }
+
+        if quads_grew {
+            // We ran out of passes while still growing the quad buffers, so
+            // this frame is drawn with truncated geometry. The buffers are
+            // now large enough, so ask for one more frame to fill it in
+            // rather than leaving a partially rendered window on screen.
+            log::warn!(
+                "paint_pass did not converge within {} passes; \
+                 quad buffers were grown, repainting",
+                MAX_PAINT_RETRIES
+            );
+            if let Some(window) = self.window.as_ref() {
+                window.invalidate();
+            }
         }
 
         log::debug!("paint_impl before call_draw elapsed={:?}", start.elapsed());
@@ -348,8 +374,8 @@ impl crate::TermWindow {
                     // Only cover the OS border area; the tab bar paints its own
                     // transparent background in paint_tab_bar(), so including
                     // tab_bar_height here would double-paint that region.
-                    // When tab bar is at top, it starts at y=0 and covers the
-                    // titlebar area completely, so no top fill needed.
+                    // When the tab bar is at top, it owns the titlebar strip
+                    // and paints that area itself, so no separate top fill is needed.
                     // paint_window_borders() repaints the full top OS border
                     // with the pane background (on a higher layer) whenever the
                     // integrated-buttons inset is active. Filling it here too
@@ -362,6 +388,7 @@ impl crate::TermWindow {
                         &self.config,
                         self.layout_is_effective_fullscreen(),
                         self.show_tab_bar && !self.config.tab_bar_at_bottom,
+                        self.dimensions.dpi as f32,
                     ) > 0
                     {
                         0.0

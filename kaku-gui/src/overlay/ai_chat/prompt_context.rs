@@ -29,6 +29,7 @@ pub(crate) use crate::ai_chat_engine::build_system_prompt;
 pub(crate) fn build_environment_message(ctx: &TerminalContext) -> ApiMessage {
     crate::ai_chat_engine::build_environment_message(&EnvironmentInputs {
         cwd: &ctx.cwd,
+        remote_host: ctx.remote_host.as_deref(),
         panel_cols: Some(ctx.panel_cols),
         panel_rows: Some(ctx.panel_rows),
         include_terminal_metadata: true,
@@ -108,6 +109,7 @@ mod tests {
         };
         TerminalContext {
             cwd: "/tmp".to_string(),
+            remote_host: None,
             visible_lines: visible.iter().map(|s| s.to_string()).collect(),
             tab_snapshot: String::new(),
             selected_text: String::new(),

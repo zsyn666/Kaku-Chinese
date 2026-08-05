@@ -69,11 +69,12 @@ use termwiz::surface::SequenceNo;
 use wezterm_dynamic::Value;
 use wezterm_font::units::PixelLength;
 use wezterm_font::FontConfiguration;
-use wezterm_term::color::{ColorPalette, SrgbaTuple};
+use wezterm_term::color::ColorPalette;
 use wezterm_term::input::LastMouseClick;
 use wezterm_term::{Alert, Progress, StableRowIndex, TerminalConfiguration, TerminalSize};
 use wezterm_toast_notification::ToastNotification;
 
+mod ai_chat;
 pub mod background;
 pub mod box_model;
 pub mod charselect;
@@ -1160,8 +1161,10 @@ pub struct TermWindow {
     selection_copy_disabled_hint_shown: bool,
     last_window_title: String,
 
-    /// Panes that currently have an ai_chat overlay open; used to implement Cmd+L toggle.
-    ai_chat_overlay_panes: std::collections::HashSet<PaneId>,
+    /// Panes that currently have an ai_chat overlay open. The sender keeps each
+    /// running overlay synchronized with config-driven palette changes.
+    ai_chat_overlay_panes:
+        HashMap<PaneId, std::sync::mpsc::Sender<crate::overlay::ai_chat::ChatPalette>>,
 }
 
 impl TermWindow {
@@ -1466,7 +1469,7 @@ impl TermWindow {
             .and_then(|m| m.get_active_tab_for_window(self.mux_window_id))
             .and_then(|tab| tab.get_active_pane().map(|p| p.pane_id()));
         match pane_id {
-            Some(id) => self.ai_chat_overlay_panes.contains(&id),
+            Some(id) => self.ai_chat_overlay_panes.contains_key(&id),
             None => false,
         }
     }
@@ -1646,6 +1649,7 @@ impl TermWindow {
             &config,
             false,
             show_tab_bar && !config.tab_bar_at_bottom,
+            dpi as f32,
         );
         if integrated_top_inset > 0 {
             border.top += ULength::new(integrated_top_inset);
@@ -1812,7 +1816,7 @@ impl TermWindow {
             toast_shaped_width: None,
             selection_copy_disabled_hint_shown: false,
             last_window_title: String::new(),
-            ai_chat_overlay_panes: std::collections::HashSet::new(),
+            ai_chat_overlay_panes: HashMap::new(),
             live_resizing: false,
             pending_screen_change_resize: false,
             pending_pty_flush_after_resize: false,
@@ -2441,7 +2445,13 @@ impl TermWindow {
                                 .map(|pane| {
                                     let user_vars = pane.copy_user_vars();
                                     (
-                                        user_vars.get("kaku_last_cmd").cloned(),
+                                        user_vars.get("kaku_last_cmd").and_then(|value| {
+                                            kaku_gui_lib::inline_ai_control::decode_control_value(
+                                                "kaku_last_cmd",
+                                                value,
+                                            )
+                                            .map(str::to_string)
+                                        }),
                                         user_vars.get("WEZTERM_PROG").cloned(),
                                         pane.get_title(),
                                         pane.get_foreground_process_name(CachePolicy::AllowStale),
@@ -2521,6 +2531,7 @@ impl TermWindow {
                 }
                 MuxNotification::TabResized(_) => {
                     // Also handled by wezterm-client
+                    self.resize_overlays();
                     self.update_title_post_status();
                 }
                 MuxNotification::TabTitleChanged { .. } => {
@@ -3124,6 +3135,9 @@ impl TermWindow {
         };
         self.config = config.clone();
         self.palette.take();
+        let chat_colors = ai_chat::chat_palette(self.palette());
+        self.ai_chat_overlay_panes
+            .retain(|_, sender| sender.send(chat_colors.clone()).is_ok());
 
         let mux = Mux::get();
         let window = match mux.get_window(self.mux_window_id) {
@@ -3484,6 +3498,14 @@ impl TermWindow {
         if !window_contains_pane {
             return;
         }
+
+        let value = match kaku_gui_lib::inline_ai_control::decode_control_value(&name, &value) {
+            Some(value) => value.to_string(),
+            None => {
+                log::warn!("Ignored unauthenticated Kaku control user var {name}");
+                return;
+            }
+        };
 
         // `k` CLI running inside a Kaku pane signals us to open the AI chat overlay.
         if name == "kaku_open_ai_chat" {
@@ -4028,7 +4050,8 @@ impl TermWindow {
 
     /// Show a confirmation overlay before applying a pending update, since
     /// applying closes every window and stops running tasks. Routed here from
-    /// the update toast click via the front window.
+    /// the update toast click, menu "Restart to Update", and menu "Check for
+    /// Updates" when a staged package is already ready.
     pub(crate) fn show_update_confirmation(&mut self) {
         let mux = Mux::get();
         let tab = match mux.get_active_tab_for_window(self.mux_window_id) {
@@ -4051,15 +4074,29 @@ impl TermWindow {
             Some(mux_window) => mux_window.get_active_idx(),
             None => return,
         };
+        self.show_tab_navigator_at(active_tab_idx);
+    }
+
+    fn show_tab_navigator_at(&mut self, initial_choice_idx: usize) {
+        let mux = Mux::get();
+        let initial_choice_idx = match mux.get_window(self.mux_window_id) {
+            Some(mux_window) if !mux_window.is_empty() => {
+                initial_choice_idx.min(mux_window.len() - 1)
+            }
+            _ => return,
+        };
         let title = "Tab Navigator".to_string();
         let args = LauncherActionArgs {
             title: Some(title),
             flags: LauncherFlags::TABS,
-            help_text: None,
+            help_text: Some(
+                "Select an item and press Enter=launch  Backspace=close  Esc=cancel  /=filter"
+                    .to_string(),
+            ),
             fuzzy_help_text: None,
             alphabet: None,
         };
-        self.show_launcher_impl(args, active_tab_idx);
+        self.show_launcher_impl(args, initial_choice_idx, true);
     }
 
     fn show_launcher(&mut self) {
@@ -4073,10 +4110,15 @@ impl TermWindow {
             fuzzy_help_text: None,
             alphabet: None,
         };
-        self.show_launcher_impl(args, 0);
+        self.show_launcher_impl(args, 0, false);
     }
 
-    fn show_launcher_impl(&mut self, args: LauncherActionArgs, initial_choice_idx: usize) {
+    fn show_launcher_impl(
+        &mut self,
+        args: LauncherActionArgs,
+        initial_choice_idx: usize,
+        is_tab_navigator: bool,
+    ) {
         let window = self.window.as_ref().unwrap().clone();
 
         let mux = Mux::get();
@@ -4085,9 +4127,18 @@ impl TermWindow {
             None => return,
         };
 
-        let pane = match self.get_active_pane_or_overlay() {
-            Some(pane) => pane,
-            None => return,
+        // A rebuilt Navigator can overlap the prior overlay's shutdown, so bind
+        // its actions to the real pane rather than the overlay being replaced.
+        let pane = if is_tab_navigator {
+            match tab.get_active_pane() {
+                Some(pane) => pane,
+                None => return,
+            }
+        } else {
+            match self.get_active_pane_or_overlay() {
+                Some(pane) => pane,
+                None => return,
+            }
         };
 
         let domain_id_of_current_pane = tab
@@ -4129,6 +4180,7 @@ impl TermWindow {
                     entries.push(LauncherTabEntry {
                         title: crate::tabbar::compute_tab_plain_title(tab),
                         pane_id,
+                        tab_id: tab.tab_id,
                     });
                     continue;
                 }
@@ -4155,6 +4207,7 @@ impl TermWindow {
                             format!("  |- {title}")
                         },
                         pane_id: pane.pane.pane_id(),
+                        tab_id: tab.tab_id,
                     });
                 }
             }
@@ -4182,7 +4235,12 @@ impl TermWindow {
                     let window = window.clone();
                     let (overlay, future) =
                         start_overlay(term_window, &tab, move |_tab_id, term| {
-                            launcher(args, term, launcher_initial_choice_idx)
+                            launcher(
+                                args,
+                                term,
+                                launcher_initial_choice_idx,
+                                is_tab_navigator,
+                            )
                         });
 
                     term_window.assign_overlay(tab_id, overlay);
@@ -4195,7 +4253,10 @@ impl TermWindow {
                                     tx: None,
                                 });
                             }
-                            Ok(Some(LauncherAction::ActivatePane(target_pane_id))) => {
+                            Ok(Some(LauncherAction::ActivatePane {
+                                pane_id: target_pane_id,
+                                ..
+                            })) => {
                                 window.notify(TermWindowNotif::Apply(Box::new(
                                     move |term_window| {
                                         if let Err(err) = Mux::get()
@@ -4206,6 +4267,13 @@ impl TermWindow {
                                             );
                                         }
                                         term_window.update_title_post_status();
+                                    },
+                                )));
+                            }
+                            Ok(Some(LauncherAction::CloseNavigatorTab(tab_id))) => {
+                                window.notify(TermWindowNotif::Apply(Box::new(
+                                    move |term_window| {
+                                        term_window.close_tab_from_navigator(tab_id);
                                     },
                                 )));
                             }
@@ -4609,7 +4677,7 @@ impl TermWindow {
                     fuzzy_help_text: args.fuzzy_help_text.clone(),
                     alphabet: args.alphabet.clone(),
                 };
-                self.show_launcher_impl(args, 0);
+                self.show_launcher_impl(args, 0, false);
             }
             HideApplication => {
                 let con = Connection::get().expect("call on gui thread");
@@ -4672,125 +4740,24 @@ impl TermWindow {
                 self.do_open_link_at_mouse_cursor(pane);
             }
             EmitEvent(name) => {
-                if name == "kaku-ai-chat" {
-                    let pane_id_check = pane.pane_id();
-                    if self.ai_chat_overlay_panes.contains(&pane_id_check) {
-                        self.cancel_overlay_for_pane(pane_id_check);
-                        return Ok(PerformAssignmentResult::Handled);
+                if let Some(job_id) = name.strip_prefix(crate::inline_ai::EVENT_PREFIX) {
+                    if let Err(err) = crate::inline_ai::spawn_job(job_id) {
+                        log::error!("failed to start inline AI job {job_id}: {err:#}");
                     }
-                    let dims = pane.get_dimensions();
-                    // Collect only the last 20 visible rows for the implicit prompt context.
-                    let bottom = dims.physical_top + dims.viewport_rows as StableRowIndex;
-                    let visible_top = bottom.saturating_sub(20);
-                    let (_, lines) = pane.get_lines(visible_top..bottom);
-                    let visible_lines: Vec<String> =
-                        lines.iter().map(|l| l.as_str().to_string()).collect();
-                    // Freeze a larger pane snapshot for explicit `@tab` attachment use.
-                    let tab_top = bottom.saturating_sub(120);
-                    let (_, tab_lines) = pane.get_lines(tab_top..bottom);
-                    let mut tab_snapshot = String::new();
-                    for line in tab_lines {
-                        let text = line.as_str();
-                        let next_len = tab_snapshot.len() + text.len() + 1;
-                        if next_len > 12 * 1024 {
-                            break;
-                        }
-                        if !tab_snapshot.is_empty() {
-                            tab_snapshot.push('\n');
-                        }
-                        tab_snapshot.push_str(&text);
-                    }
-                    let cwd = pane
-                        .get_current_working_dir(CachePolicy::AllowStale)
-                        .map(|u| u.path().to_string())
-                        .unwrap_or_default();
-                    let selected_text = self.selection_text(pane);
-
-                    // Extract last command status and output if available
-                    let last_exit_code = pane.get_last_command_status();
-
-                    let last_command_output = if let (Some(code), Some(output_start)) =
-                        (last_exit_code, pane.get_last_command_output_start())
-                    {
-                        if code != 0 {
-                            // Only extract output when command failed
-                            let output_end = bottom.min(output_start + 51);
-                            if output_end > output_start {
-                                let (_, output_lines) = pane.get_lines(output_start..output_end);
-                                Some(
-                                    output_lines
-                                        .iter()
-                                        .map(|l| l.as_str().to_string())
-                                        .collect(),
-                                )
-                            } else {
-                                None
-                            }
-                        } else {
-                            None
-                        }
-                    } else {
-                        None
-                    };
-
-                    let pal = self.palette().clone();
-                    // Helper: wrap a resolved SrgbaTuple as a ChatPalette color field.
-                    fn srgb(t: SrgbaTuple) -> SrgbaTuple {
-                        t
-                    }
-                    // colors.0 layout: 0-7 = ANSI, 8-15 = bright ANSI.
-                    // bright cyan (14) for accent, bright black (8) for border,
-                    // bright yellow (11) for user header.
-                    let chat_colors = crate::overlay::ai_chat::ChatPalette {
-                        bg: srgb(pal.background),
-                        fg: srgb(pal.foreground),
-                        accent: srgb(pal.colors.0[14]),
-                        border: srgb(pal.colors.0[8]),
-                        user_header: srgb(pal.colors.0[11]),
-                        user_text: srgb(pal.foreground),
-                        ai_text: srgb(pal.foreground),
-                        selection_fg: srgb(pal.selection_fg),
-                        selection_bg: srgb(pal.selection_bg),
-                    };
-                    let context = crate::overlay::ai_chat::TerminalContext {
-                        cwd,
-                        visible_lines,
-                        tab_snapshot,
-                        selected_text,
-                        colors: chat_colors,
-                        panel_cols: dims.cols,
-                        panel_rows: dims.viewport_rows,
-                        last_exit_code,
-                        last_command_output,
-                    };
-                    let pane_id = pane.pane_id();
-                    let (overlay, future) =
-                        start_overlay_pane(self, &pane, move |pane_id, term| {
-                            crate::overlay::ai_chat::ai_chat_overlay(pane_id, term, context)
-                        });
-                    self.assign_overlay_for_pane(pane_id, overlay);
-                    self.ai_chat_overlay_panes.insert(pane_id);
-                    // Shrink bottom padding for the chat overlay. Re-run layout
-                    // so the overlay pane gets the extra row(s) immediately.
-                    if let Some(window) = self.window.clone() {
-                        let dims = self.dimensions.clone();
-                        self.apply_dimensions(&dims, None, &window, false);
-                    }
-                    promise::spawn::spawn(async move {
-                        if let Err(e) = future.await {
-                            log::error!("AI chat overlay error for pane {pane_id}: {e:#}");
-                        }
-                    })
-                    .detach();
+                    return Ok(PerformAssignmentResult::Handled);
+                } else if name == "kaku-ai-chat" {
+                    ai_chat::toggle_overlay(self, pane);
                 } else if name == "update-kaku" || name == "run-kaku-update" {
-                    crate::frontend::run_kaku_update_from_menu();
+                    crate::frontend::check_for_updates_from_menu();
                 } else if name == "restart-to-update" {
-                    crate::frontend::restart_to_update();
+                    crate::frontend::confirm_and_apply_update();
                 } else if name == "run-kaku-cli" {
-                    let result = pane.writer().write_all(b"kaku\n");
+                    let command = format!("{}\n", crate::frontend::kaku_cli_shell_invocation());
+                    let result = pane.writer().write_all(command.as_bytes());
                     self.finish_terminal_input(pane, result)?;
                 } else if name == "run-kaku-ai-config" {
-                    let result = pane.writer().write_all(b"kaku ai\n");
+                    let command = format!("{} ai\n", crate::frontend::kaku_cli_shell_invocation());
+                    let result = pane.writer().write_all(command.as_bytes());
                     self.finish_terminal_input(pane, result)?;
                 } else if let Some(msg) = lookup_kaku_toast(name) {
                     self.show_toast(msg.to_string());
@@ -4800,6 +4767,8 @@ impl TermWindow {
                 } else if name == "kaku-toast-ai-generating" {
                     let message = "Kaku generating command";
                     self.show_ai_progress_toast(message.to_string(), ai_toast_lifetime_ms(message));
+                } else if name == "kaku-toast-ai-clear-progress" {
+                    self.clear_ai_progress_toast();
                 } else if name == "kaku-toast-ai-applied" {
                     // No notification on successful apply; command output is enough.
                 } else if let Some(msg) = lookup_ai_toast(name) {
@@ -5203,6 +5172,7 @@ impl TermWindow {
             } else {
                 None
             };
+            let file_link_editor = self.config.file_link_editor.clone();
 
             let window = GuiWin::new(self);
             let pane = MuxPane(pane.pane_id());
@@ -5214,6 +5184,7 @@ impl TermWindow {
                 link: String,
                 resolved_target: Option<FileLinkTarget>,
                 explicit_file_link: bool,
+                file_link_editor: Option<String>,
             ) -> anyhow::Result<()> {
                 let default_click = match lua {
                     Some(lua) => {
@@ -5250,6 +5221,7 @@ impl TermWindow {
                                     &target,
                                     explicit_file_link,
                                     use_default_app,
+                                    file_link_editor.as_deref(),
                                 ) {
                                     log::warn!(
                                         "Failed to open file link target {:?}: {err:#}",
@@ -5276,6 +5248,7 @@ impl TermWindow {
                     uri,
                     resolved_target,
                     is_explicit_file_link,
+                    file_link_editor,
                 )
             }))
             .detach();
@@ -5310,7 +5283,22 @@ impl TermWindow {
         target: &FileLinkTarget,
         explicit: bool,
         use_default_app: bool,
+        configured_editor: Option<&str>,
     ) -> anyhow::Result<()> {
+        let mut configured_editor_error = None;
+        if let Some(editor) = configured_editor {
+            match Self::try_open_configured_editor(editor, target) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    log::warn!(
+                        "Configured file link editor `{}` failed; trying fallbacks: {error:#}",
+                        editor
+                    );
+                    configured_editor_error = Some(error);
+                }
+            }
+        }
+
         #[cfg(target_os = "macos")]
         if explicit && Self::try_open_path_with_default_app(&target.path)? {
             return Ok(());
@@ -5348,6 +5336,14 @@ impl TermWindow {
             }
         }
 
+        if let Some(error) = configured_editor_error {
+            return Err(error).with_context(|| {
+                format!(
+                    "configured editor and all fallbacks failed for {}",
+                    target.path.display()
+                )
+            });
+        }
         anyhow::bail!("failed to open {}", target.path.display())
     }
 
@@ -5377,6 +5373,82 @@ impl TermWindow {
         }
 
         Ok(false)
+    }
+
+    fn try_open_configured_editor(raw: &str, target: &FileLinkTarget) -> anyhow::Result<()> {
+        let (program, args) =
+            Self::parse_editor_command(raw.trim()).context("parse config.file_link_editor")?;
+        let location = Self::file_link_location(target);
+
+        Self::run_editor_path_command(&program, &args, Path::new(&location))
+            .with_context(|| format!("launch config.file_link_editor `{program}`"))
+    }
+
+    fn editor_program_candidates(program: &str) -> Vec<String> {
+        if program.contains('/') {
+            return vec![program.to_string()];
+        }
+
+        let mut candidates = vec![program.to_string()];
+        if let Some(home) = dirs_next::home_dir() {
+            candidates.push(
+                home.join(".local")
+                    .join("bin")
+                    .join(program)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+        candidates.push(format!("/opt/homebrew/bin/{program}"));
+        candidates.push(format!("/usr/local/bin/{program}"));
+        match program {
+            "code" => candidates.extend(
+                VSCODE_OPEN_CANDIDATES
+                    .iter()
+                    .skip(1)
+                    .map(|candidate| (*candidate).to_string()),
+            ),
+            "cursor" => candidates
+                .push("/Applications/Cursor.app/Contents/Resources/app/bin/cursor".to_string()),
+            _ => {}
+        }
+        // De-dup while preserving probe order: PATH lookup first, then the
+        // conventional locations in the order they were pushed.
+        let mut seen = std::collections::HashSet::new();
+        candidates.retain(|candidate| seen.insert(candidate.clone()));
+        candidates
+    }
+
+    fn run_editor_path_command(program: &str, args: &[String], path: &Path) -> std::io::Result<()> {
+        let mut not_found = None;
+        for candidate in Self::editor_program_candidates(program) {
+            match Self::run_path_command(&candidate, args, path) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    not_found = Some(error);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(not_found.unwrap_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("editor executable `{program}` was not found"),
+            )
+        }))
+    }
+
+    fn file_link_location(target: &FileLinkTarget) -> String {
+        let mut location = target.path.display().to_string();
+        if let Some(line) = target.line {
+            location.push(':');
+            location.push_str(&line.to_string());
+            if let Some(col) = target.col {
+                location.push(':');
+                location.push_str(&col.to_string());
+            }
+        }
+        location
     }
 
     fn try_open_in_configured_editor(path: &Path) -> anyhow::Result<bool> {
@@ -5537,6 +5609,105 @@ impl TermWindow {
         }
     }
 
+    fn close_tab_from_navigator(&mut self, tab_id: TabId) {
+        let mux = Mux::get();
+        let target = {
+            let mux_window = match mux.get_window(self.mux_window_id) {
+                Some(window) => window,
+                None => return,
+            };
+            if mux_window.len() <= 1 {
+                return;
+            }
+            mux_window.idx_by_id(tab_id).and_then(|tab_idx| {
+                mux_window
+                    .get_by_idx(tab_idx)
+                    .cloned()
+                    .map(|tab| (tab_idx, tab))
+            })
+        };
+
+        let Some((tab_idx, tab)) = target else {
+            self.show_tab_navigator();
+            return;
+        };
+
+        let should_confirm = self
+            .config
+            .tab_close_confirmation
+            .should_prompt(true, || tab.can_close_without_prompting(CloseReason::Tab));
+        if should_confirm {
+            let Some(host_tab) = mux.get_active_tab_for_window(self.mux_window_id) else {
+                return;
+            };
+            let host_tab_id = host_tab.tab_id();
+            if let Some(window) = self.window.clone() {
+                let notify_window = window.clone();
+                let (overlay, future) = start_overlay(self, &host_tab, move |_tab_id, mut term| {
+                    crate::overlay::confirm::run_confirmation(
+                        "Close this tab?\nAll panes in this tab will be terminated.",
+                        &mut term,
+                    )
+                });
+                self.assign_overlay(host_tab_id, overlay);
+                promise::spawn::spawn(async move {
+                    let confirmed = match future.await {
+                        Ok(confirmed) => confirmed,
+                        Err(err) => {
+                            log::error!("tab navigator close confirmation failed: {err:#}");
+                            false
+                        }
+                    };
+                    notify_window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                        term_window.finish_navigator_tab_close(tab_id, confirmed);
+                    })));
+                })
+                .detach();
+            }
+        } else {
+            self.record_closed_tab_cwd(&tab);
+            if mux.remove_tab(tab_id).is_some() {
+                self.update_title();
+                self.show_tab_navigator_at(tab_idx);
+            } else {
+                self.show_tab_navigator();
+            }
+        }
+    }
+
+    fn finish_navigator_tab_close(&mut self, tab_id: TabId, confirmed: bool) {
+        let mux = Mux::get();
+        let (tab_count, active_idx, target) = {
+            let mux_window = match mux.get_window(self.mux_window_id) {
+                Some(window) => window,
+                None => return,
+            };
+            let target = mux_window.idx_by_id(tab_id).and_then(|tab_idx| {
+                mux_window
+                    .get_by_idx(tab_idx)
+                    .cloned()
+                    .map(|tab| (tab_idx, tab))
+            });
+            (mux_window.len(), mux_window.get_active_idx(), target)
+        };
+
+        let initial_choice_idx = match target {
+            Some((tab_idx, tab)) if confirmed && tab_count > 1 => {
+                self.record_closed_tab_cwd(&tab);
+                if mux.remove_tab(tab_id).is_some() {
+                    self.update_title();
+                    tab_idx
+                } else {
+                    active_idx
+                }
+            }
+            Some((tab_idx, _)) => tab_idx,
+            None => active_idx,
+        };
+
+        self.show_tab_navigator_at(initial_choice_idx);
+    }
+
     fn close_specific_tab(&mut self, tab_idx: usize, confirm: bool) {
         let mux = Mux::get();
         let mux_window_id = self.mux_window_id;
@@ -5604,17 +5775,21 @@ impl TermWindow {
             }
         } else {
             // No confirmation needed: record cwd and close immediately.
-            if let Some(pane) = tab.get_active_pane() {
-                if let Some(cwd) = pane
-                    .get_current_working_dir(mux::pane::CachePolicy::AllowStale)
-                    .and_then(|url| url.to_file_path().ok())
-                {
-                    if cwd.is_absolute() {
-                        self.push_closed_tab_cwd(cwd);
-                    }
+            self.record_closed_tab_cwd(&tab);
+            mux.remove_tab(tab_id);
+        }
+    }
+
+    fn record_closed_tab_cwd(&mut self, tab: &Arc<Tab>) {
+        if let Some(pane) = tab.get_active_pane() {
+            if let Some(cwd) = pane
+                .get_current_working_dir(mux::pane::CachePolicy::AllowStale)
+                .and_then(|url| url.to_file_path().ok())
+            {
+                if cwd.is_absolute() {
+                    self.push_closed_tab_cwd(cwd);
                 }
             }
-            mux.remove_tab(tab_id);
         }
     }
 
@@ -5736,14 +5911,47 @@ impl TermWindow {
         }
     }
 
+    /// Normalize an explicit user-driven scroll request. Unlike passive
+    /// scrollback pruning, an interactive request that overshoots the oldest
+    /// row should stop there instead of snapping to the bottom.
+    fn normalize_interactive_viewport(
+        position: Option<StableRowIndex>,
+        dims: RenderableDimensions,
+    ) -> Option<StableRowIndex> {
+        match position {
+            Some(pos) if pos >= dims.physical_top => None,
+            Some(pos) => {
+                let clamped = pos.max(dims.scrollback_top);
+                (clamped < dims.physical_top).then_some(clamped)
+            }
+            None => None,
+        }
+    }
+
+    fn selection_drag_controls_pane(
+        selection_drag_active: bool,
+        current_mouse_capture: Option<&MouseCapture>,
+        pane_id: PaneId,
+    ) -> bool {
+        selection_drag_active
+            && matches!(
+                current_mouse_capture,
+                Some(MouseCapture::TerminalPane(captured_pane_id))
+                    if *captured_pane_id == pane_id
+            )
+    }
+
     fn reconcile_viewport(
         position: Option<StableRowIndex>,
         was_primary_peek: bool,
         is_primary_peek: bool,
+        pin_pruned_viewport: bool,
         dims: RenderableDimensions,
     ) -> Option<StableRowIndex> {
         if was_primary_peek && !is_primary_peek {
             None
+        } else if pin_pruned_viewport {
+            Self::normalize_interactive_viewport(position, dims)
         } else {
             Self::normalize_viewport(position, dims)
         }
@@ -5756,8 +5964,18 @@ impl TermWindow {
         let mut state = self.pane_state(pane_id);
         let viewport = state.viewport;
         let was_primary_peek = state.was_primary_peek;
-        let next_viewport =
-            Self::reconcile_viewport(viewport, was_primary_peek, is_primary_peek, dims);
+        let pin_pruned_viewport = Self::selection_drag_controls_pane(
+            self.selection_drag_active,
+            self.current_mouse_capture.as_ref(),
+            pane_id,
+        );
+        let next_viewport = Self::reconcile_viewport(
+            viewport,
+            was_primary_peek,
+            is_primary_peek,
+            pin_pruned_viewport,
+            dims,
+        );
 
         if next_viewport != viewport {
             if was_primary_peek && !is_primary_peek {
@@ -5795,7 +6013,7 @@ impl TermWindow {
             dims.physical_top,
             dims.scrollback_top,
         );
-        let pos = Self::normalize_viewport(position, dims);
+        let pos = Self::normalize_interactive_viewport(position, dims);
 
         let mut state = self.pane_state(pane_id);
         if pos != state.viewport {
@@ -6341,7 +6559,7 @@ impl TermWindow {
                 Mux::get().remove_pane(overlay.pane.pane_id());
             }
         }
-        let was_chat = self.ai_chat_overlay_panes.remove(&pane_id);
+        let was_chat = self.ai_chat_overlay_panes.remove(&pane_id).is_some();
         if let Some(window) = self.window.as_ref() {
             window.invalidate();
         }
@@ -6410,8 +6628,13 @@ impl Drop for TermWindow {
 
 #[cfg(test)]
 mod tests {
-    use super::{bell_notification_message, InputBroadcastMode, RenderableDimensions, TermWindow};
+    use super::{
+        bell_notification_message, FileLinkTarget, InputBroadcastMode, MouseCapture,
+        RenderableDimensions, TermWindow,
+    };
+    use mux::pane::PaneId;
     use mux::tab::TabId;
+    use std::path::PathBuf;
     use wezterm_term::StableRowIndex;
 
     #[test]
@@ -6450,6 +6673,43 @@ mod tests {
     fn parse_editor_command_rejects_empty_value() {
         let err = TermWindow::parse_editor_command("   ").unwrap_err();
         assert!(err.to_string().contains("editor command is empty"));
+    }
+
+    #[test]
+    fn configured_editor_candidates_cover_finder_launch_paths() {
+        let zed = TermWindow::editor_program_candidates("zed");
+        assert_eq!(zed.first().map(String::as_str), Some("zed"));
+        assert!(zed.iter().any(|path| path == "/usr/local/bin/zed"));
+
+        let cursor = TermWindow::editor_program_candidates("cursor");
+        assert!(cursor
+            .iter()
+            .any(|path| { path == "/Applications/Cursor.app/Contents/Resources/app/bin/cursor" }));
+
+        assert_eq!(
+            TermWindow::editor_program_candidates("/custom/editor"),
+            vec!["/custom/editor"]
+        );
+    }
+
+    #[test]
+    fn configured_editor_location_preserves_line_and_column() {
+        let target = FileLinkTarget {
+            path: PathBuf::from("/tmp/demo.rs"),
+            line: Some(12),
+            col: Some(3),
+        };
+        assert_eq!(TermWindow::file_link_location(&target), "/tmp/demo.rs:12:3");
+    }
+
+    #[test]
+    fn configured_editor_location_uses_plain_path_without_line() {
+        let target = FileLinkTarget {
+            path: PathBuf::from("/tmp/demo.rs"),
+            line: None,
+            col: Some(3),
+        };
+        assert_eq!(TermWindow::file_link_location(&target), "/tmp/demo.rs");
     }
 
     #[test]
@@ -6550,9 +6810,75 @@ mod tests {
     #[test]
     fn reconcile_viewport_clears_stale_peek_viewport_on_exit() {
         assert_eq!(
-            TermWindow::reconcile_viewport(Some(120), true, false, dims(40, 0)),
+            TermWindow::reconcile_viewport(Some(20), true, false, false, dims(40, 0)),
             None
         );
+        // A peek exit remains authoritative while a selection drag is active.
+        assert_eq!(
+            TermWindow::reconcile_viewport(Some(20), true, false, true, dims(40, 0)),
+            None
+        );
+    }
+
+    #[test]
+    fn interactive_viewport_clamps_page_up_past_scrollback_top() {
+        let page_up_target = 110isize.saturating_sub(24);
+        assert_eq!(
+            TermWindow::normalize_interactive_viewport(Some(page_up_target), dims(150, 100)),
+            Some(100)
+        );
+        // Positions still inside scrollback are preserved.
+        assert_eq!(
+            TermWindow::normalize_interactive_viewport(Some(120), dims(150, 100)),
+            Some(120)
+        );
+    }
+
+    #[test]
+    fn interactive_viewport_follows_bottom_when_nothing_left_to_pin() {
+        // No scrollback remains (scrollback_top == physical_top): follow live
+        // output.
+        assert_eq!(
+            TermWindow::normalize_interactive_viewport(Some(90), dims(150, 150)),
+            None
+        );
+        // Bottom-follow position stays bottom-follow.
+        assert_eq!(
+            TermWindow::normalize_interactive_viewport(Some(150), dims(150, 100)),
+            None
+        );
+        assert_eq!(
+            TermWindow::normalize_interactive_viewport(None, dims(150, 100)),
+            None
+        );
+    }
+
+    #[test]
+    fn selection_drag_only_controls_the_captured_pane() {
+        let captured_pane = PaneId::new(1);
+        let sibling_pane = PaneId::new(2);
+        let capture = MouseCapture::TerminalPane(captured_pane);
+
+        assert!(TermWindow::selection_drag_controls_pane(
+            true,
+            Some(&capture),
+            captured_pane
+        ));
+        assert!(!TermWindow::selection_drag_controls_pane(
+            true,
+            Some(&capture),
+            sibling_pane
+        ));
+        assert!(!TermWindow::selection_drag_controls_pane(
+            false,
+            Some(&capture),
+            captured_pane
+        ));
+        assert!(!TermWindow::selection_drag_controls_pane(
+            true,
+            Some(&MouseCapture::UI),
+            captured_pane
+        ));
     }
 
     #[test]

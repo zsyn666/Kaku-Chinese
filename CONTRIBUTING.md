@@ -11,7 +11,7 @@ cd Kaku
 brew install rustup
 echo "export PATH=\"$(brew --prefix rustup)/bin:\$HOME/.cargo/bin:\$PATH\"" >> ~/.zprofile
 exec zsh -l
-rustup toolchain install 1.93.0
+rustup toolchain install 1.95.0
 
 # Install required tools (cargo-nextest, cargo-watch, nightly rustfmt)
 make install-tools

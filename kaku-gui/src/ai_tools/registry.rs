@@ -342,9 +342,9 @@ pub fn all_tools(config: &AssistantConfig) -> Vec<ToolDef> {
                 "pattern": { "type": "string", "description": "Regular expression pattern to search for" },
                 "path": { "type": "string", "description": "Directory or file to search in (defaults to cwd)" },
                 "glob": { "type": "string", "description": "File glob filter, e.g. '*.rs' or '*.{ts,tsx}' (optional)" },
-                "context_lines": { "type": "integer", "description": "Lines of context before and after each match (default 2)" },
+                "context_lines": { "type": "integer", "minimum": 0, "maximum": 100, "description": "Lines of context before and after each match (default 2, max 100)" },
                 "case_insensitive": { "type": "boolean", "description": "Case-insensitive matching (default false)" },
-                "max_results": { "type": "integer", "description": "Maximum number of matching lines to return (default 100)" },
+                "max_results": { "type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum number of matching lines to return (default 100, max 1000)" },
                 "detail": {
                     "type": "string",
                     "enum": ["brief", "default", "full"],

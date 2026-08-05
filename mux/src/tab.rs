@@ -924,9 +924,12 @@ impl Tab {
         request: SplitRequest,
         pane: Arc<dyn Pane>,
     ) -> anyhow::Result<usize> {
-        self.inner
+        let new_index = self
+            .inner
             .lock()
-            .split_and_insert(pane_index, request, pane)
+            .split_and_insert(pane_index, request, pane)?;
+        Mux::try_get().map(|mux| mux.notify(MuxNotification::TabResized(self.tab_id())));
+        Ok(new_index)
     }
 
     pub fn get_zoomed_pane(&self) -> Option<Arc<dyn Pane>> {
@@ -2771,6 +2774,75 @@ mod test {
         fn get_current_working_dir(&self, _policy: CachePolicy) -> Option<Url> {
             None
         }
+    }
+
+    struct ResetMux;
+
+    impl Drop for ResetMux {
+        fn drop(&mut self) {
+            Mux::shutdown();
+        }
+    }
+
+    #[test]
+    fn split_notifies_after_layout_is_updated() {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let _reset_mux = ResetMux;
+
+        let tab = Arc::new(Tab::new(&size));
+        tab.assign_pane(&FakePane::new_arc(PaneId::new(1), size));
+
+        let tab_id = tab.tab_id();
+        let observed_layout = Arc::new(Mutex::new(Vec::new()));
+        let observed_layout_for_subscriber = Arc::clone(&observed_layout);
+        let tab_for_subscriber = Arc::clone(&tab);
+        mux.subscribe(move |notification| {
+            if let MuxNotification::TabResized(resized_tab_id) = notification {
+                if *resized_tab_id == tab_id {
+                    let panes = tab_for_subscriber.iter_panes();
+                    observed_layout_for_subscriber.lock().push(
+                        panes
+                            .iter()
+                            .map(|pane| (pane.top, pane.height))
+                            .collect::<Vec<_>>(),
+                    );
+                }
+            }
+            true
+        });
+
+        let split_size = tab
+            .compute_split_size(
+                0,
+                SplitRequest {
+                    direction: SplitDirection::Vertical,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        tab.split_and_insert(
+            0,
+            SplitRequest {
+                direction: SplitDirection::Vertical,
+                ..Default::default()
+            },
+            FakePane::new_arc(PaneId::new(2), split_size.second),
+        )
+        .unwrap();
+
+        assert_eq!(
+            observed_layout.lock().as_slice(),
+            &[vec![(0, 11), (12, 12)]],
+        );
     }
 
     #[test]

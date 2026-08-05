@@ -14,9 +14,6 @@ k9.workspace = true
 [build-dependencies]
 gl_generator.workspace = true
 
-[features]
-wayland = []
-
 [dependencies]
 async-channel.workspace = true
 async-io.workspace = true

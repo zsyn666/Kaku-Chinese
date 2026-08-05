@@ -8,7 +8,7 @@ YELLOW='\033[1;33m'
 BOLD='\033[1m'
 NC='\033[0m'
 
-CONFIG_DIR="$HOME/.config/kaku"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/kaku"
 STATE_FILE="$CONFIG_DIR/state.json"
 LEGACY_VERSION_FILE="$CONFIG_DIR/.kaku_config_version"
 LEGACY_GEOMETRY_FILE="$CONFIG_DIR/.kaku_window_geometry"
@@ -25,7 +25,15 @@ source "$COMMON_SCRIPT"
 CURRENT_CONFIG_VERSION="$(read_bundled_config_version "$SCRIPT_DIR")"
 
 detect_kaku_setup_script() {
-	case "${KAKU_TARGET_SHELL:-${SHELL:-/bin/zsh}}" in
+	local shell_candidate
+	shell_candidate="${KAKU_TARGET_SHELL:-}"
+	if [[ -z "$shell_candidate" ]]; then
+		shell_candidate="$(read_managed_shell || true)"
+	fi
+	if [[ -z "$shell_candidate" ]]; then
+		shell_candidate="${SHELL:-/bin/zsh}"
+	fi
+	case "$shell_candidate" in
 		*fish|fish)
 			printf 'setup_fish.sh'
 			;;

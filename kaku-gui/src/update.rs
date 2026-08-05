@@ -750,8 +750,9 @@ pub fn start_update_checker() {
         // Register callback so a notification click asks for confirmation
         // before doing anything destructive. Applying an update closes every
         // window and stops running tasks, so a stray click must not trigger it
-        // silently. The confirmed action picks the staged fast-path or the
-        // terminal-tab flow inside apply_update_now().
+        // silently. Menu "Restart to Update" and staged "Check for Updates"
+        // share the same confirm path. The confirmed action picks the staged
+        // fast-path or the terminal-tab flow inside apply_update_now().
         wezterm_toast_notification::set_update_click_callback(|| {
             crate::frontend::confirm_and_apply_update();
         });

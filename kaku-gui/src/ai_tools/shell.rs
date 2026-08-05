@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::process::CommandExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -20,6 +20,27 @@ pub(super) const SHELL_EXEC_TIMEOUT_SECS: u64 = 60;
 pub(super) fn kill_process_group(child: &std::process::Child) {
     unsafe {
         libc::killpg(child.id() as libc::pid_t, libc::SIGKILL);
+    }
+}
+
+fn shell_exec_wrapper(command: &str, cwd_tmp_path: &Path, shell: &str) -> String {
+    let is_fish = Path::new(shell)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "fish");
+
+    if is_fish {
+        format!(
+            "{}; set __kaku_rc $status; printf '%s' (pwd) > {}; exit $__kaku_rc",
+            command,
+            cwd_tmp_path.display()
+        )
+    } else {
+        format!(
+            "{}; __kaku_rc=$?; printf '%s' \"$(pwd)\" > {}; exit $__kaku_rc",
+            command,
+            cwd_tmp_path.display()
+        )
     }
 }
 
@@ -102,12 +123,8 @@ pub(super) fn exec_shell_exec(
         .mode(0o600)
         .open(&cwd_tmp_path)
         .with_context(|| format!("could not create temp cwd file {}", cwd_tmp_path.display()))?;
-    let wrapped = format!(
-        "{}; __kaku_rc=$?; printf '%s' \"$(pwd)\" > {}; exit $__kaku_rc",
-        command,
-        cwd_tmp_path.display()
-    );
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/bash".into());
+    let wrapped = shell_exec_wrapper(command, &cwd_tmp_path, &shell);
     let streaming_cap = cap.saturating_sub(512);
 
     let mut child = std::process::Command::new(&shell)
@@ -331,5 +348,34 @@ pub(super) fn exec_shell_poll(
             "pid {}: {} {}\n{}",
             pid, done_str, exit_str, final_snapshot
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::shell_exec_wrapper;
+    use std::path::Path;
+
+    #[test]
+    fn shell_exec_wrapper_uses_fish_syntax() {
+        let wrapped =
+            shell_exec_wrapper("false", Path::new("/tmp/kaku-cwd"), "/usr/local/bin/fish");
+
+        assert_eq!(
+            wrapped,
+            "false; set __kaku_rc $status; printf '%s' (pwd) > /tmp/kaku-cwd; exit $__kaku_rc"
+        );
+    }
+
+    #[test]
+    fn shell_exec_wrapper_keeps_posix_syntax_for_zsh_and_bash() {
+        for shell in ["/bin/bash", "/bin/zsh"] {
+            let wrapped = shell_exec_wrapper("false", Path::new("/tmp/kaku-cwd"), shell);
+
+            assert_eq!(
+                wrapped,
+                "false; __kaku_rc=$?; printf '%s' \"$(pwd)\" > /tmp/kaku-cwd; exit $__kaku_rc"
+            );
+        }
     }
 }

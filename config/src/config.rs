@@ -293,6 +293,10 @@ pub struct Config {
     #[dynamic(default = "default_hyperlink_rules")]
     pub hyperlink_rules: Vec<hyperlink::Rule>,
 
+    /// Optional command used to open local file links. Kaku appends the
+    /// resolved path and, when present, its line and column.
+    pub file_link_editor: Option<String>,
+
     /// What to set the TERM variable to
     #[dynamic(default = "default_term")]
     pub term: String,
@@ -2208,6 +2212,33 @@ pub fn default_hyperlink_rules() -> Vec<hyperlink::Rule> {
         hyperlink::Rule::new(hyperlink::GENERIC_HYPERLINK_PATTERN, "$0").unwrap(),
         // implicit mailto link
         hyperlink::Rule::new(r"\b\w+@[\w-]+(\.[\w-]+)+\b", "mailto:$0").unwrap(),
+        // Bare domains without an explicit scheme: www.-prefixed hosts, and
+        // hosts ending in a curated TLD allowlist. These must come before the
+        // file-path rule: on equal-length overlaps (github.com/tw93/kaku) the
+        // earlier rule wins, and the web interpretation is the useful one.
+        // Emails and scheme'd URLs are longer matches and keep priority.
+        // The allowlist deliberately excludes TLDs that collide with common
+        // file suffixes (sh, md, rs, py, js, go, cc, so, in, pl, pm, ml, tf,
+        // zip, mov, app) so deploy.sh or dist/Kaku.app never become web
+        // links; .app in particular is wall-to-wall macOS bundle names in a
+        // terminal. Lookarounds are ASCII-only so domains adjacent to CJK
+        // text stay clickable, and a sentence-final dot stays out of the
+        // match.
+        hyperlink::Rule::new(
+            r"(?i)(?<![0-9a-z._-])www\.[0-9a-z-]+(?:\.[0-9a-z-]+)+(?::\d+)?(?:/[\x21-\x7e]*[_/a-zA-Z0-9-]|/)?(?!\.?[0-9a-z_-])",
+            "https://$0",
+        )
+        .unwrap(),
+        // The TLD group is case-sensitive lowercase (real domains render
+        // lowercase in terminals) so namespace-style identifiers such as
+        // `System.Net` never match, and a match directly followed by `(` is
+        // rejected so method calls like `model.to(device)` / `df.info()`
+        // stay plain text.
+        hyperlink::Rule::new(
+            r"(?i)(?<![0-9a-z._-])(?:[0-9a-z][0-9a-z-]*\.)+(?-i:com|net|org|edu|gov|io|dev|ai|fun|xyz|me|im|tv|to|co|info|biz|tech|site|online|cloud|blog|store|link|live|news|cn|jp|kr|uk|de|fr|us|ca|au|br|ru|nl|se|ch|hk|tw|sg)(?::\d+)?(?:/[\x21-\x7e]*[_/a-zA-Z0-9-]|/)?(?!\.?[0-9a-z_-]|\()",
+            "https://$0",
+        )
+        .unwrap(),
         // File paths: support absolute paths, common relative prefixes, and
         // bare relative paths like `kaku/src/main.rs`.
         // Supports file:line and file:line:col formats.
@@ -2395,6 +2426,116 @@ mod tests {
         assert_eq!(
             file_uri("see docker/Dockerfile,"),
             "file://docker/Dockerfile"
+        );
+    }
+
+    #[test]
+    fn bare_domain_hyperlinks_get_https_scheme() {
+        let rules = default_hyperlink_rules();
+        let uri = |text: &str| -> Option<String> {
+            Rule::match_hyperlinks(text, &rules)
+                .into_iter()
+                .find(|m| m.link.uri().starts_with("https://"))
+                .map(|m| m.link.uri().to_string())
+        };
+
+        assert_eq!(uri("visit kaku.fun."), Some("https://kaku.fun".to_string()));
+        assert_eq!(
+            uri("\u{53BB} kaku.fun\u{3002}"),
+            Some("https://kaku.fun".to_string())
+        );
+        assert_eq!(
+            uri("www.example.org rocks"),
+            Some("https://www.example.org".to_string())
+        );
+        assert_eq!(
+            uri("released at github.com/tw93/kaku today"),
+            Some("https://github.com/tw93/kaku".to_string())
+        );
+        assert_eq!(
+            uri("dev server on demo.example.com:8080/index"),
+            Some("https://demo.example.com:8080/index".to_string())
+        );
+    }
+
+    #[test]
+    fn bare_domain_beats_file_rule_on_equal_overlap() {
+        let rules = default_hyperlink_rules();
+        // Both the bare-domain rule and the file-path rule match this whole
+        // span. After the length sort the earlier rule comes first, and the
+        // first match is the one whose link wins when applied to cells.
+        let first = Rule::match_hyperlinks("github.com/tw93/kaku", &rules)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(first.link.uri(), "https://github.com/tw93/kaku");
+    }
+
+    #[test]
+    fn bare_domain_skips_file_suffix_lookalike_tlds() {
+        let rules = default_hyperlink_rules();
+        for text in [
+            "run deploy.sh now",
+            "see README.md",
+            "building main.rs",
+            "loaded libfoo.so",
+            "regenerated Makefile.in",
+            "open dist/Kaku.app",
+            "plain Kaku.app name",
+            // Method calls and namespace identifiers, not domains.
+            "tensor model.to(device) done",
+            "print df.info() output",
+            "using System.Net;",
+            "import System.IO.Path",
+            "call foo.De() here",
+        ] {
+            assert!(
+                !Rule::match_hyperlinks(text, &rules)
+                    .into_iter()
+                    .any(|m| m.link.uri().starts_with("https://")),
+                "{:?} must not produce a web link",
+                text
+            );
+        }
+    }
+
+    #[test]
+    fn email_keeps_priority_over_bare_domain() {
+        let rules = default_hyperlink_rules();
+        let first = Rule::match_hyperlinks("mail user@github.com now", &rules)
+            .into_iter()
+            .next()
+            .unwrap();
+        assert_eq!(first.link.uri(), "mailto:user@github.com");
+    }
+
+    #[test]
+    fn deprecated_language_field_still_loads() {
+        // V0.11.0 shipped `config.language`; the i18n revert (b4d779a) removed
+        // the field. It was re-introduced as a real (non-deprecated) field by
+        // the zh-CN fork, but this test still guards that a kaku.lua carrying
+        // `config.language` from an older config loads without error.
+        use std::collections::BTreeMap;
+        use wezterm_dynamic::{FromDynamic, FromDynamicOptions, UnknownFieldAction, Value};
+
+        let mut map: BTreeMap<Value, Value> = BTreeMap::new();
+        map.insert(
+            Value::String("language".to_string()),
+            Value::String("zh-CN".to_string()),
+        );
+        let value = Value::Object(map.into());
+
+        let result = super::Config::from_dynamic(
+            &value,
+            FromDynamicOptions {
+                unknown_fields: UnknownFieldAction::Deny,
+                deprecated_fields: UnknownFieldAction::Warn,
+            },
+        );
+        assert!(
+            result.is_ok(),
+            "config carrying a `language` field must still load: {:?}",
+            result
         );
     }
 

@@ -35,7 +35,6 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
     if inside_kaku && args.prompt.is_none() && !args.new && args.resume.is_none() {
         use base64::engine::general_purpose::STANDARD;
         use base64::Engine as _;
-        use std::io::Write;
         // The receiving terminal suppresses SetUserVar alerts when the decoded
         // value matches the previous one, so each invocation needs a unique
         // payload to re-trigger the overlay after the user closed it.
@@ -43,7 +42,11 @@ pub fn run(args: CliArgs) -> anyhow::Result<()> {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
-        let encoded = STANDARD.encode(nonce.to_string());
+        let control_value = crate::inline_ai_control::encode_control_value(
+            "kaku_open_ai_chat",
+            &nonce.to_string(),
+        )?;
+        let encoded = STANDARD.encode(control_value);
         print!("\x1b]1337;SetUserVar=kaku_open_ai_chat={}\x07", encoded);
         let _ = std::io::stdout().flush();
         return Ok(());
@@ -109,6 +112,8 @@ fn run_one_shot(engine: &mut Engine, prompt: String) -> anyhow::Result<()> {
     let rx = engine.submit(prompt);
     let mut assistant_buf = String::new();
     let mut reasoning_buf = String::new();
+    let mut responses_items = Vec::new();
+    let mut completed_successfully = false;
     let stdout = std::io::stdout();
 
     for msg in rx {
@@ -123,6 +128,7 @@ fn run_one_shot(engine: &mut Engine, prompt: String) -> anyhow::Result<()> {
             StreamMsg::Reasoning(t) => {
                 reasoning_buf.push_str(&t);
             }
+            StreamMsg::ResponsesState(items) => responses_items = items,
             StreamMsg::ToolStart { name, args_preview } => {
                 eprintln!("  -> {} {}", name, args_preview);
             }
@@ -143,6 +149,7 @@ fn run_one_shot(engine: &mut Engine, prompt: String) -> anyhow::Result<()> {
                 let _ = reply_tx.send(approved);
             }
             StreamMsg::Done => {
+                completed_successfully = true;
                 println!();
                 break;
             }
@@ -153,9 +160,11 @@ fn run_one_shot(engine: &mut Engine, prompt: String) -> anyhow::Result<()> {
         }
     }
 
-    if !assistant_buf.is_empty() {
-        engine.record_assistant_with_reasoning(assistant_buf, reasoning_buf);
-        engine.spawn_post_round_tasks();
+    if !assistant_buf.is_empty() || !responses_items.is_empty() {
+        engine.record_assistant_with_state(assistant_buf, reasoning_buf, responses_items);
+        if completed_successfully {
+            engine.spawn_post_round_tasks();
+        }
     }
 
     Ok(())
@@ -225,6 +234,8 @@ struct Tui {
     /// Pending assistant buffer for record_assistant after Done.
     pending_assistant: String,
     pending_reasoning: String,
+    pending_responses_items: Vec<serde_json::Value>,
+    stream_completed_successfully: bool,
     /// Pending approval request waiting for user y/N.
     pending_approval: Option<(String, SyncSender<bool>)>,
     scroll_offset: usize,
@@ -246,6 +257,8 @@ impl Tui {
             stream_rx: None,
             pending_assistant: String::new(),
             pending_reasoning: String::new(),
+            pending_responses_items: Vec::new(),
+            stream_completed_successfully: false,
             pending_approval: None,
             scroll_offset: 0,
             cols,
@@ -351,6 +364,9 @@ impl Tui {
                         changed = true;
                     }
                 }
+                Ok(StreamMsg::ResponsesState(items)) => {
+                    self.pending_responses_items = items;
+                }
                 Ok(StreamMsg::AssistantStart) => {}
                 Ok(StreamMsg::ToolStart { name, args_preview }) => {
                     self.streaming_buf
@@ -381,6 +397,7 @@ impl Tui {
                         self.messages.push(KMsg::Ai(ai_text));
                     }
                     self.is_streaming = false;
+                    self.stream_completed_successfully = true;
                     changed = true;
                     // Don't put rx back; stream is finished.
                     return changed;
@@ -392,6 +409,7 @@ impl Tui {
                     }
                     self.messages.push(KMsg::System(format!("[error] {}", e)));
                     self.is_streaming = false;
+                    self.stream_completed_successfully = false;
                     changed = true;
                     return changed;
                 }
@@ -536,11 +554,17 @@ fn run_repl(engine: &mut Engine) -> anyhow::Result<()> {
             needs_redraw = true;
 
             // After streaming done, record assistant response.
-            if !tui.is_streaming && !tui.pending_assistant.is_empty() {
+            if !tui.is_streaming
+                && (!tui.pending_assistant.is_empty() || !tui.pending_responses_items.is_empty())
+            {
                 let buf = std::mem::take(&mut tui.pending_assistant);
                 let reasoning = std::mem::take(&mut tui.pending_reasoning);
-                engine.record_assistant_with_reasoning(buf, reasoning);
-                engine.spawn_post_round_tasks();
+                let responses_items = std::mem::take(&mut tui.pending_responses_items);
+                engine.record_assistant_with_state(buf, reasoning, responses_items);
+                if tui.stream_completed_successfully {
+                    engine.spawn_post_round_tasks();
+                }
+                tui.stream_completed_successfully = false;
             }
         }
 
@@ -702,6 +726,8 @@ fn run_repl(engine: &mut Engine) -> anyhow::Result<()> {
                 tui.streaming_buf.clear();
                 tui.pending_assistant.clear();
                 tui.pending_reasoning.clear();
+                tui.pending_responses_items.clear();
+                tui.stream_completed_successfully = false;
                 tui.stream_rx = Some(engine.submit(trimmed));
                 tui.scroll_to_bottom();
                 needs_redraw = true;
@@ -876,10 +902,31 @@ mod tests {
 
         assert!(tui.drain_stream());
         assert!(!tui.is_streaming);
+        assert!(tui.stream_completed_successfully);
         assert!(tui.pending_assistant.is_empty());
         assert!(tui.messages.iter().all(|msg| match msg {
             KMsg::Ai(text) => !text.is_empty(),
             _ => true,
+        }));
+    }
+
+    #[test]
+    fn stream_error_preserves_partial_text_without_success_state() {
+        let (tx, rx) = sync_channel(4);
+        let mut tui = Tui::new(80, 24);
+        tui.is_streaming = true;
+        tui.stream_rx = Some(rx);
+
+        tx.send(StreamMsg::Token("partial".to_string())).unwrap();
+        tx.send(StreamMsg::Err("truncated".to_string())).unwrap();
+
+        assert!(tui.drain_stream());
+        assert!(!tui.is_streaming);
+        assert!(!tui.stream_completed_successfully);
+        assert_eq!(tui.pending_assistant, "partial");
+        assert!(tui.messages.iter().any(|msg| match msg {
+            KMsg::Ai(text) => text == "partial",
+            _ => false,
         }));
     }
 }

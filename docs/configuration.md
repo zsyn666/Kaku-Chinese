@@ -162,6 +162,20 @@ config.cursor_blink_rate = 500
 config.scrollback_lines = 10000  -- default
 ```
 
+**File link editor**
+
+Set an editor command for local file links printed in the terminal. Kaku appends
+the resolved `path`, or `path:line:column` when the link includes a location.
+Shell-style quoting is supported for command arguments:
+
+```lua
+config.file_link_editor = "zed"
+-- config.file_link_editor = "cursor --goto"
+```
+
+This setting takes priority over Kaku's automatic VS Code detection. When it is
+unset, Kaku keeps the existing VS Code and `$VISUAL` / `$EDITOR` fallback behavior.
+
 **Copy on select**
 
 Enabled by default. Disable:
@@ -343,7 +357,7 @@ wezterm.on('augment-command-palette', function(window, pane)
   -- so directories containing spaces or non-ASCII characters work too.
   local host = cwd_obj.host
   if cwd_obj.scheme ~= 'file'
-      or (host and host ~= '' and host ~= 'localhost' and host ~= wezterm.hostname()) then
+      or (host and host ~= '' and host ~= 'localhost' and host ~= wezterm.hostname():lower()) then
     return {}
   end
   local cwd = cwd_obj.file_path

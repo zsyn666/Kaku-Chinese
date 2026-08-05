@@ -43,7 +43,7 @@ Menubar **必须同步初始化**。延后到 async block 会丢早期按键事�
 
 ## Key Equivalent
 
-新增 KeyAssignment 前确认走 Kaku 自己的 `command_for_key` 路径，不要走 AppKit menu 的 `performKeyEquivalent`。后者会经过被 PAC-fault 的注入项。
+新增 KeyAssignment 前确认走 Kaku 自己的按键分发路径，不要走 AppKit menu 的 `performKeyEquivalent`。后者会经过被 PAC-fault 的注入项。
 
 ### menu keyEquivalent 会拦 keyDown，吞掉 raw-mode TUI 的 Ctrl+letter
 
@@ -54,7 +54,7 @@ macOS 26 上 NSMenu 的 keyEquivalent modifier 匹配并不严格相等。给 me
 - `termwiz/src/input.rs` 的 `encode` 对 `is_down=false` 直接返回空字符串，PTY 上一个字节都不会到。
 - 普通 shell `cat -v` 测试看到 `^C` 不代表 raw-mode 也工作；启动时机和 cooked vs raw 都会让 menu 拦截表现不一致。**必须**在 raw-mode TUI (claude / codex / vim / htop) 里实测。
 
-兜底：任何"模仿系统快捷键"的 menu 项宁可 `keys: vec![]` 不设快捷键，让用户从菜单点。`kaku-gui/src/commands.rs` 1000 行附近的 keyEquivalent 装配逻辑应该统一从 `candidate[0]` 取 modifiers，不要走 `forced_equiv_mods` 这种特例化路径。
+兜底：任何"模仿系统快捷键"的 menu 项宁可 `keys: vec![]` 不设快捷键，让用户从菜单点。`kaku-gui/src/commands.rs` 里的 keyEquivalent 装配逻辑必须统一从按键候选本身取 modifiers，不要为个别 menu 项走强制 modifier 的特例化路径（历史上的特例化路径已删，不要加回）。
 
 参考历史：`a14b26d` 之后的 CenterWindow 修复（删掉给 Window > Center 装 `Fn+Ctrl+C` keyEquivalent 的特例，因为 macOS 26 把它当 plain Ctrl+C 拦了，导致 raw-mode 下 Ctrl+C 不退 claude/codex）。
 

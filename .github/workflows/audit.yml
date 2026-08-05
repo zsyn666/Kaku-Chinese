@@ -1,9 +1,10 @@
 name: Security Audit
 
 # Weekly cargo-audit run over Cargo.lock. Reports RustSec advisories that
-# affect any transitive dependency in the workspace. Not a PR gate; the action
-# opens/updates a dedicated issue when new advisories appear so triage stays
-# visible without blocking everyday merges.
+# affect any transitive dependency in the workspace. Not a PR gate; a red run
+# on main is the triage signal. cargo-audit comes from the Homebrew bottle
+# because building it from source (rustsec/audit-check does) breaks whenever
+# its dependency tree bumps MSRV past the runner's rustc.
 
 on:
   schedule:
@@ -21,8 +22,6 @@ on:
 
 permissions:
   contents: read
-  issues: write
-  checks: write
 
 jobs:
   audit:
@@ -32,7 +31,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Install cargo-audit
+        run: brew install cargo-audit
+
       - name: Run cargo audit
-        uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2.0.0
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+        run: cargo audit

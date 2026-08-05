@@ -659,6 +659,10 @@ struct KakuAssistantConfig {
     /// Auth mechanism: "api_key", "copilot", or "codex". Stored as opaque
     /// round-trip value; TUI does not branch on this.
     auth_type: String,
+    /// API transport for API-key/custom endpoints.
+    api_mode: String,
+    /// Whether Responses requests include the provider-hosted web_search tool.
+    native_web_search: bool,
     /// Optional extra request headers as `Name: Value`
     custom_headers: Vec<String>,
     /// Deep chat model. Empty means reuse Simple Model.
@@ -705,6 +709,8 @@ impl KakuAssistantConfig {
             },
             base_url: resolved_base_url,
             auth_type: "api_key".to_string(),
+            api_mode: "chat_completions".to_string(),
+            native_web_search: false,
             custom_headers: vec![],
             chat_model: String::new(),
             chat_model_choices: Vec::new(),
@@ -750,6 +756,14 @@ impl KakuAssistantConfig {
 
     fn auth_type(&self) -> &str {
         &self.auth_type
+    }
+
+    fn api_mode(&self) -> &str {
+        &self.api_mode
+    }
+
+    fn native_web_search(&self) -> bool {
+        self.native_web_search
     }
 
     fn web_search_provider(&self) -> &str {
@@ -845,6 +859,15 @@ fn parse_kaku_assistant_config(raw: &str) -> KakuAssistantConfig {
         .get("auth_type")
         .and_then(|v| v.as_str())
         .unwrap_or("api_key");
+    let api_mode = parsed
+        .get("api_mode")
+        .and_then(|v| v.as_str())
+        .filter(|value| matches!(*value, "chat_completions" | "responses"))
+        .unwrap_or("chat_completions");
+    let native_web_search = parsed
+        .get("native_web_search")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     let custom_headers = parse_custom_headers_toml(parsed.get("custom_headers"));
     let auto_fix_ignored_exit_codes =
         parse_exit_codes_toml(parsed.get("auto_fix_ignored_exit_codes"));
@@ -905,6 +928,8 @@ fn parse_kaku_assistant_config(raw: &str) -> KakuAssistantConfig {
         .with_auto_fix_ignored_exit_codes(auto_fix_ignored_exit_codes)
         .with_web_search(web_search_provider, web_search_api_key);
     cfg.auth_type = stored_auth_type.to_string();
+    cfg.api_mode = api_mode.to_string();
+    cfg.native_web_search = native_web_search;
     cfg.chat_model = deep_model;
     cfg.chat_model_choices = chat_model_choices;
     cfg
@@ -1142,6 +1167,26 @@ fn extract_kaku_assistant_fields_with_model_options(
             options: vec!["api_key".into(), "codex".into()],
             editable: true,
         },
+    ];
+
+    if !is_codex {
+        fields.push(FieldEntry {
+            key: "API Mode".into(),
+            value: cfg.api_mode().to_string(),
+            options: vec!["chat_completions".into(), "responses".into()],
+            editable: true,
+        });
+        if cfg.api_mode() == "responses" {
+            fields.push(FieldEntry {
+                key: "Native Web Search".into(),
+                value: if cfg.native_web_search() { "On" } else { "Off" }.into(),
+                options: vec!["On".into(), "Off".into()],
+                editable: true,
+            });
+        }
+    }
+
+    fields.extend([
         FieldEntry {
             key: "Simple Model".into(),
             value: cfg.model().to_string(),
@@ -1154,7 +1199,7 @@ fn extract_kaku_assistant_fields_with_model_options(
             options: model_options.clone(),
             editable: true,
         },
-    ];
+    ]);
 
     // codex talks to a fixed Responses backend and reuses the CLI OAuth login,
     // so neither Base URL nor API Key applies there.
@@ -1213,7 +1258,7 @@ fn render_toml_string(value: &str) -> String {
     toml::Value::String(value.to_string()).to_string()
 }
 
-fn write_kaku_assistant_config(path: &Path, cfg: &KakuAssistantConfig) -> anyhow::Result<()> {
+fn render_kaku_assistant_config(cfg: &KakuAssistantConfig) -> String {
     let mut out = String::new();
     out.push_str("# Kaku Assistant configuration\n");
     out.push_str(
@@ -1227,7 +1272,11 @@ fn write_kaku_assistant_config(path: &Path, cfg: &KakuAssistantConfig) -> anyhow
     out.push_str(
         "# auto_fix_ignored_exit_codes: optional exit codes that should not trigger automatic command-fix suggestions.\n",
     );
-    out.push_str("# base_url: chat-completions API root URL.\n");
+    out.push_str("# base_url: OpenAI-compatible API root URL.\n");
+    out.push_str("# api_mode: chat_completions (default) or responses for /responses endpoints.\n");
+    out.push_str(
+        "# native_web_search: add the provider-hosted web_search tool in responses mode.\n",
+    );
     out.push_str(
         "# custom_headers: optional extra HTTP headers for enterprise proxies or API gateways.\n",
     );
@@ -1279,6 +1328,16 @@ fn write_kaku_assistant_config(path: &Path, cfg: &KakuAssistantConfig) -> anyhow
         "base_url = {}\n",
         render_toml_string(cfg.base_url().trim())
     ));
+    if cfg.api_mode() == "responses" {
+        out.push_str("api_mode = \"responses\"\n");
+    } else {
+        out.push_str("# api_mode = \"responses\"\n");
+    }
+    if cfg.native_web_search() {
+        out.push_str("native_web_search = true\n");
+    } else {
+        out.push_str("# native_web_search = true\n");
+    }
     // Persist auth_type only when it differs from "api_key" so the Codex provider
     // (same base_url as OpenAI) can be reliably identified on next load.
     if cfg.auth_type() != "api_key" {
@@ -1317,8 +1376,66 @@ fn write_kaku_assistant_config(path: &Path, cfg: &KakuAssistantConfig) -> anyhow
             ));
         }
     }
-    write_atomic(path, out.as_bytes()).with_context(|| format!("write {}", path.display()))?;
-    Ok(())
+    out
+}
+
+#[cfg(test)]
+fn write_kaku_assistant_config(path: &Path, cfg: &KakuAssistantConfig) -> anyhow::Result<()> {
+    let out = render_kaku_assistant_config(cfg);
+    write_atomic(path, out.as_bytes()).with_context(|| format!("write {}", path.display()))
+}
+
+/// Update the fields owned by the TUI while retaining runtime-only and future
+/// top-level keys. Reconstructing the whole file used to silently turn
+/// `chat_tools_enabled = false` back into the GUI default and dropped custom
+/// integrations whenever an unrelated field was edited.
+fn write_kaku_assistant_config_preserving(
+    path: &Path,
+    cfg: &KakuAssistantConfig,
+    original_raw: &str,
+) -> anyhow::Result<()> {
+    const TUI_MANAGED_KEYS: &[&str] = &[
+        "enabled",
+        "api_key",
+        "model",
+        "fast_model",
+        "chat_model",
+        "chat_model_choices",
+        "auto_fix_ignored_exit_codes",
+        "base_url",
+        "api_mode",
+        "native_web_search",
+        "auth_type",
+        "custom_headers",
+        "web_search_provider",
+        "web_search_api_key",
+    ];
+
+    let canonical = render_kaku_assistant_config(cfg);
+    // toml_edit keeps the user's comments, ordering, and formatting for every
+    // line the TUI does not own; plain `toml` re-serialization stripped all
+    // template comments on each save.
+    let Ok(mut original) = original_raw.parse::<toml_edit::DocumentMut>() else {
+        return write_atomic(path, canonical.as_bytes())
+            .with_context(|| format!("write {}", path.display()));
+    };
+    let canonical_doc = canonical
+        .parse::<toml_edit::DocumentMut>()
+        .context("parse generated assistant config")?;
+
+    for key in TUI_MANAGED_KEYS {
+        match canonical_doc.get(key) {
+            Some(item) => {
+                original[*key] = item.clone();
+            }
+            None => {
+                original.remove(key);
+            }
+        }
+    }
+
+    write_atomic(path, original.to_string().as_bytes())
+        .with_context(|| format!("write {}", path.display()))
 }
 
 fn save_kaku_assistant_field(field_key: &str, new_val: &str) -> anyhow::Result<()> {
@@ -1408,6 +1525,18 @@ fn save_kaku_assistant_field_to_path(
                 .with_web_search(cfg.web_search_provider(), cfg.web_search_api_key())
                 .with_chat_model_passthrough(&cfg)
         }
+        "API Mode" => {
+            KakuAssistantConfig::new(cfg.is_enabled(), cfg.api_key(), cfg.model(), cfg.base_url())
+                .with_custom_headers(cfg.custom_headers().to_vec())
+                .with_web_search(cfg.web_search_provider(), cfg.web_search_api_key())
+                .with_chat_model_passthrough(&cfg)
+        }
+        "Native Web Search" => {
+            KakuAssistantConfig::new(cfg.is_enabled(), cfg.api_key(), cfg.model(), cfg.base_url())
+                .with_custom_headers(cfg.custom_headers().to_vec())
+                .with_web_search(cfg.web_search_provider(), cfg.web_search_api_key())
+                .with_chat_model_passthrough(&cfg)
+        }
         "API Key" => KakuAssistantConfig::new(
             cfg.is_enabled(),
             new_val.trim(),
@@ -1489,9 +1618,25 @@ fn save_kaku_assistant_field_to_path(
     } else {
         cfg.auth_type().to_string()
     };
+    updated.api_mode = if field_key == "API Mode" {
+        if new_val.trim() == "responses" {
+            "responses".to_string()
+        } else {
+            "chat_completions".to_string()
+        }
+    } else {
+        cfg.api_mode().to_string()
+    };
+    updated.native_web_search = if updated.api_mode != "responses" {
+        false
+    } else if field_key == "Native Web Search" {
+        matches!(new_val.trim(), "On" | "on" | "true" | "1")
+    } else {
+        cfg.native_web_search()
+    };
     updated.auto_fix_ignored_exit_codes = cfg.auto_fix_ignored_exit_codes().to_vec();
 
-    write_kaku_assistant_config(path, &updated)
+    write_kaku_assistant_config_preserving(path, &updated, &raw)
 }
 
 /// Get Gemini account email from google_accounts.json
@@ -5091,6 +5236,7 @@ provider = "managed:kimi-code"
         // Fixed rows always present.
         for key in &[
             "Enabled",
+            "API Mode",
             "Simple Model",
             "Deep Model",
             "Base URL",
@@ -5262,6 +5408,10 @@ provider = "managed:kimi-code"
             !fields.iter().any(|f| f.key == "Base URL"),
             "Base URL field must be hidden under codex auth"
         );
+        assert!(
+            !fields.iter().any(|f| f.key == "API Mode"),
+            "API Mode is fixed and must be hidden under codex auth"
+        );
         // Auth Type sits right after Enabled.
         assert_eq!(fields.first().map(|f| f.key.as_str()), Some("Enabled"));
         assert_eq!(fields.get(1).map(|f| f.key.as_str()), Some("Auth Type"));
@@ -5272,6 +5422,42 @@ provider = "managed:kimi-code"
         assert!(!saved2.contains("auth_type ="));
         let fields2 = extract_kaku_assistant_fields(&saved2);
         assert!(fields2.iter().any(|f| f.key == "API Key"));
+    }
+
+    #[test]
+    fn kaku_assistant_responses_and_native_search_round_trip() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("assistant.toml");
+        std::fs::write(
+            &path,
+            "enabled = true\nmodel = \"gpt-5.4-mini\"\nbase_url = \"https://api.openai.com/v1\"\n",
+        )
+        .expect("write temp config");
+
+        save_kaku_assistant_field_to_path(&path, "API Mode", "responses")
+            .expect("save responses mode");
+        let fields = extract_kaku_assistant_fields(
+            &std::fs::read_to_string(&path).expect("read responses config"),
+        );
+        assert!(fields
+            .iter()
+            .any(|field| field.key == "API Mode" && field.value == "responses"));
+        assert!(fields
+            .iter()
+            .any(|field| { field.key == "Native Web Search" && field.value == "Off" }));
+
+        save_kaku_assistant_field_to_path(&path, "Native Web Search", "On")
+            .expect("enable native search");
+        save_kaku_assistant_field_to_path(&path, "Simple Model", "gpt-5.4")
+            .expect("round-trip transport fields");
+        let saved = std::fs::read_to_string(&path).expect("read saved config");
+        assert!(saved.lines().any(|line| line == "api_mode = \"responses\""));
+        assert!(saved.lines().any(|line| line == "native_web_search = true"));
+
+        save_kaku_assistant_field_to_path(&path, "API Mode", "chat_completions")
+            .expect("restore chat completions");
+        let saved = std::fs::read_to_string(&path).expect("read restored config");
+        assert!(!saved.lines().any(|line| line == "native_web_search = true"));
     }
 
     #[test]
@@ -5302,6 +5488,74 @@ provider = "managed:kimi-code"
         let cfg2 = parse_kaku_assistant_config(&saved);
         assert_eq!(cfg2.chat_model(), "gpt-5.4");
         assert_eq!(cfg2.chat_model_choices(), &["gpt-5.4", "claude-sonnet-4-6"]);
+    }
+
+    #[test]
+    fn kaku_assistant_tui_save_preserves_runtime_and_unknown_keys() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("assistant.toml");
+        std::fs::write(
+            &path,
+            concat!(
+                "enabled = true\n",
+                "model = \"gpt-5.4-mini\"\n",
+                "base_url = \"https://api.openai.com/v1\"\n",
+                "chat_tools_enabled = false\n",
+                "web_fetch_script = \"~/bin/fetch-safe\"\n",
+                "memory_curator_model = \"gpt-5.4-nano\"\n",
+                "future_provider_option = \"keep-me\"\n",
+            ),
+        )
+        .expect("write temp config");
+
+        save_kaku_assistant_field_to_path(&path, "Simple Model", "gpt-5.4").expect("save model");
+        let saved = std::fs::read_to_string(&path).expect("read saved config");
+
+        for expected in [
+            "chat_tools_enabled = false",
+            "web_fetch_script = \"~/bin/fetch-safe\"",
+            "memory_curator_model = \"gpt-5.4-nano\"",
+            "future_provider_option = \"keep-me\"",
+        ] {
+            assert!(
+                saved.contains(expected),
+                "TUI save dropped `{}`:\n{}",
+                expected,
+                saved
+            );
+        }
+    }
+
+    #[test]
+    fn kaku_assistant_tui_save_preserves_comments() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("assistant.toml");
+        std::fs::write(
+            &path,
+            concat!(
+                "# Kaku assistant configuration\n",
+                "enabled = true\n",
+                "model = \"gpt-5.4-mini\"\n",
+                "# Custom option kept across saves\n",
+                "future_provider_option = \"keep-me\"\n",
+            ),
+        )
+        .expect("write temp config");
+
+        save_kaku_assistant_field_to_path(&path, "Simple Model", "gpt-5.4").expect("save model");
+        let saved = std::fs::read_to_string(&path).expect("read saved config");
+
+        assert!(
+            saved.contains("# Kaku assistant configuration"),
+            "{}",
+            saved
+        );
+        assert!(
+            saved.contains("# Custom option kept across saves"),
+            "{}",
+            saved
+        );
+        assert!(saved.contains("model = \"gpt-5.4\""), "{}", saved);
     }
 
     #[test]

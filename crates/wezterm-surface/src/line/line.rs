@@ -584,6 +584,21 @@ impl Line {
             return;
         }
 
+        // Only a wrap attribute proves that adjacent physical rows belong to
+        // one token stream. If a caller groups hard-newline rows, scan each
+        // independently so hyperlinks cannot be fabricated across commands.
+        if logical_line.len() > 1
+            && logical_line[..logical_line.len() - 1]
+                .iter()
+                .any(|line| !line.last_cell_was_wrapped())
+        {
+            for line in logical_line.iter_mut() {
+                let mut one = [&mut **line];
+                Self::apply_hyperlink_rules(rules, &mut one);
+            }
+            return;
+        }
+
         let mut logical = logical_line[0].clone();
         for line in &logical_line[1..] {
             let seqno = logical.current_seqno().max(line.current_seqno());
@@ -609,8 +624,9 @@ impl Line {
             let is_cluster = matches!(&phys.cells, CellStorage::C(_));
             let len = phys.len();
             let remainder = logical.split_off(len, seq);
-            **phys = logical;
+            let content = logical;
             logical = remainder;
+            **phys = content;
             phys.set_last_cell_was_wrapped(wrapped, seq);
             #[cfg(feature = "appdata")]
             phys.clear_appdata();

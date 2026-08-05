@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-CONFIG_DIR="$HOME/.config/kaku"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/kaku"
 STATE_FILE="$CONFIG_DIR/state.json"
 LEGACY_VERSION_FILE="$CONFIG_DIR/.kaku_config_version"
 LEGACY_GEOMETRY_FILE="$CONFIG_DIR/.kaku_window_geometry"
@@ -19,10 +19,6 @@ fi
 source "$COMMON_SCRIPT"
 
 CURRENT_CONFIG_VERSION="$(read_bundled_config_version "$SCRIPT_DIR")"
-
-# Always persist config version at script exit to avoid repeated onboarding loops
-# when optional setup steps fail on user machines.
-trap persist_config_version EXIT
 
 # Resources directory resolution
 if [[ -f "$SCRIPT_DIR/setup_zsh.sh" ]]; then
@@ -122,11 +118,14 @@ if [[ $REPLY =~ ^[Yy]$ ]] || [[ -z $REPLY ]]; then
 fi
 
 INSTALL_THEME="$INSTALL_SHELL"
+INITIALIZATION_COMPLETE=false
 
 # Process Shell Features
 if [[ "$INSTALL_SHELL" == "true" ]]; then
 	if kaku_bin="$(resolve_kaku_cli)"; then
-		if ! KAKU_SKIP_TOOL_BOOTSTRAP=1 "$kaku_bin" init; then
+		if KAKU_SKIP_TOOL_BOOTSTRAP=1 "$kaku_bin" init; then
+			INITIALIZATION_COMPLETE=true
+		else
 			echo ""
 			echo "Warning: shell setup failed. You can retry manually:"
 			echo "  KAKU_SKIP_TOOL_BOOTSTRAP=1 \"$kaku_bin\" init"
@@ -138,7 +137,9 @@ if [[ "$INSTALL_SHELL" == "true" ]]; then
 	elif [[ -f "$SETUP_SCRIPT" ]]; then
 		echo ""
 		echo "Warning: Kaku CLI not found during first-run setup. Falling back to $(basename "$SETUP_SCRIPT")."
-		if ! KAKU_SKIP_TOOL_BOOTSTRAP=1 bash "$SETUP_SCRIPT"; then
+		if KAKU_SKIP_TOOL_BOOTSTRAP=1 bash "$SETUP_SCRIPT"; then
+			INITIALIZATION_COMPLETE=true
+		else
 			echo ""
 			echo "Warning: shell setup failed. You can retry manually:"
 			echo "  KAKU_SKIP_TOOL_BOOTSTRAP=1 bash \"$SETUP_SCRIPT\""
@@ -147,6 +148,7 @@ if [[ "$INSTALL_SHELL" == "true" ]]; then
 		echo "Error: neither kaku CLI nor $(basename "$SETUP_SCRIPT") was found for shell setup."
 	fi
 else
+	INITIALIZATION_COMPLETE=true
 	echo ""
 	echo "Skipping shell setup. You can run it manually later:"
 	if kaku_bin="$(resolve_kaku_cli)"; then
@@ -159,7 +161,7 @@ fi
 mkdir -p "$CONFIG_DIR"
 
 ensure_user_config_via_cli() {
-	local kaku_lua_dest="$HOME/.config/kaku/kaku.lua"
+	local kaku_lua_dest="$CONFIG_DIR/kaku.lua"
 	if [[ -f "$kaku_lua_dest" ]]; then
 		echo "Keeping existing user config: $kaku_lua_dest"
 		return 0
@@ -195,10 +197,14 @@ if [[ "$INSTALL_SHELL" == "true" ]]; then
 	fi
 fi
 
-echo -e "\n\033[1;32m🎃 Kaku environment is ready! Enjoy coding.\033[0m"
-
-# Persist explicitly here so successful first-run/upgrade paths are recorded.
-persist_config_version
+if [[ "$INITIALIZATION_COMPLETE" == "true" ]]; then
+	echo -e "\n\033[1;32m🎃 Kaku environment is ready! Enjoy coding.\033[0m"
+	# Persist only after the selected core setup path succeeds (or the user
+	# explicitly skips it). Failed setup remains retryable on the next launch.
+	persist_config_version
+else
+	echo -e "\n\033[1;31mKaku setup is incomplete. It will be offered again next launch.\033[0m"
+fi
 
 # Replace current process with the user's login shell
 TARGET_SHELL="$(detect_login_shell)"

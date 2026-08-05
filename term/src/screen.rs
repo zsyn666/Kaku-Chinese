@@ -1053,6 +1053,13 @@ impl Screen {
         }
     }
 
+    /// Only the terminal wrap attribute establishes logical-line ownership.
+    /// A full hard-newline row may be unrelated output; treating width alone
+    /// as continuation can fabricate URLs and other tokens across commands.
+    fn line_flows_into_next(line: &Line) -> bool {
+        line.last_cell_was_wrapped()
+    }
+
     pub fn for_each_logical_line_in_stable_range_mut<F>(
         &mut self,
         stable_range: Range<StableRowIndex>,
@@ -1072,7 +1079,7 @@ impl Screen {
         let mut back_len = 0;
         while phys_range.start > 0 {
             let prior = &mut self.lines[phys_range.start - 1];
-            if !prior.last_cell_was_wrapped() {
+            if !Self::line_flows_into_next(prior) {
                 break;
             }
             if prior.len() + back_len > MAX_LOGICAL_LINE_LEN {
@@ -1096,7 +1103,7 @@ impl Screen {
                     }
                     end_inclusive = idx;
                     total_len += line.len();
-                    if !line.last_cell_was_wrapped() {
+                    if !Self::line_flows_into_next(line) {
                         break;
                     }
                 } else if idx == phys_row {

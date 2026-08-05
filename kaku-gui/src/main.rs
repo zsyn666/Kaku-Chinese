@@ -108,6 +108,7 @@ mod customglyph;
 mod download;
 mod frontend;
 mod glyphcache;
+mod inline_ai;
 mod inputmap;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -857,6 +858,10 @@ fn run_terminal_gui(opts: StartCommand, default_domain_name: Option<String>) -> 
         opts.new_tab,
     )? {
         return Ok(());
+    }
+
+    if let Err(err) = kaku_gui_lib::inline_ai_control::initialize_capability() {
+        log::error!("Inline AI control messages are disabled: {err:#}");
     }
 
     // This process owns the GUI and will create the first window through the

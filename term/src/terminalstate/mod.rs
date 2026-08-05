@@ -849,6 +849,13 @@ impl TerminalState {
         self.screen.is_alt_screen_active()
     }
 
+    /// Whether DECCKM application cursor keys are enabled. Synthetic cursor
+    /// input (e.g. option+click cursor movement) must match the encoding the
+    /// running program negotiated.
+    pub fn application_cursor_keys_enabled(&self) -> bool {
+        self.application_cursor_keys
+    }
+
     /// Primary Screen Peek: switch rendering to primary screen while in alt screen
     pub fn is_primary_peek(&self) -> bool {
         self.primary_peek && self.screen.is_alt_screen_active()

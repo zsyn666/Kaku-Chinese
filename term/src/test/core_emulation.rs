@@ -203,3 +203,27 @@ fn multiple_tabs_hit_successive_stops() {
     term.print("\t\t");
     term.assert_cursor_pos(16, 0, Some("two tabs land at col 16"), None);
 }
+
+// ─── Logical line joining ─────────────────────────────────────────────────────
+
+#[test]
+fn logical_line_walker_does_not_join_full_width_hard_newline_rows() {
+    let mut term = TestTerm::new(4, 10, 0);
+    // Width alone cannot prove that adjacent rows share logical ownership.
+    // Explicit newlines keep them separate even when a row fills the terminal.
+    term.print("ABCDEFGHIJ\r\n  KLMNO\r\nxyz\r\n");
+
+    let mut groups: Vec<usize> = vec![];
+    term.term
+        .screen_mut()
+        .for_each_logical_line_in_stable_range_mut(0..3, |_range, lines| {
+            groups.push(lines.len());
+            true
+        });
+
+    assert_eq!(
+        groups,
+        vec![1, 1, 1],
+        "hard-newline rows stay independent regardless of width"
+    );
+}

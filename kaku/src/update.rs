@@ -74,7 +74,7 @@ mod imp {
         match resolve_update_provider()? {
             UpdateProvider::Brew(info) => {
                 println!("Detected Homebrew-managed installation. Using brew upgrade...");
-                return run_brew_upgrade(&info);
+                return run_brew_upgrade(&info, assume_yes);
             }
             UpdateProvider::Direct => {}
         }
@@ -417,7 +417,7 @@ mod imp {
         }
     }
 
-    fn run_brew_upgrade(info: &BrewInfo) -> anyhow::Result<()> {
+    fn run_brew_upgrade(info: &BrewInfo, assume_yes: bool) -> anyhow::Result<()> {
         match is_brew_cask_outdated(&info.brew_bin, &info.cask_name) {
             Ok(false) => {
                 println!(
@@ -435,6 +435,14 @@ mod imp {
             }
         }
 
+        // Same confirm gate as the direct ZIP path: brew upgrade replaces the
+        // app bundle and relaunches Kaku, which drops unsaved terminal work.
+        let label = format!("brew cask {}", info.cask_name);
+        if !confirm_apply_update(&label, assume_yes)? {
+            println!("Update cancelled.");
+            return Ok(());
+        }
+
         let primary = Command::new(&info.brew_bin)
             .arg("upgrade")
             .arg("--cask")
@@ -442,6 +450,7 @@ mod imp {
             .status()
             .with_context(|| format!("failed to run brew upgrade for {}", info.cask_name))?;
         if primary.success() {
+            println!("Upgrade completed. Relaunching Kaku...");
             if !relaunch_after_upgrade() {
                 println!("Upgrade completed. Please launch Kaku manually.");
             }
@@ -463,6 +472,7 @@ mod imp {
                 format!("failed to run brew upgrade fallback for {}", fallback_name)
             })?;
         if fallback.success() {
+            println!("Upgrade completed. Relaunching Kaku...");
             if !relaunch_after_upgrade() {
                 println!("Upgrade completed. Please launch Kaku manually.");
             }
@@ -794,8 +804,8 @@ mod imp {
     }
 
     fn confirm_apply_update(update_label: &str, assume_yes: bool) -> anyhow::Result<bool> {
-        // When launched from the GUI (menu / notification), the env var is set
-        // so the update proceeds without interactive confirmation.
+        // Set only after the GUI overlay already confirmed the restart. Menu
+        // "Check for Updates" does not set this, so the CLI still prompts.
         if std::env::var_os("KAKU_UPDATE_AUTO_CONFIRM").is_some() {
             println!("Auto-confirming update (KAKU_UPDATE_AUTO_CONFIRM is set).");
             return Ok(true);
@@ -819,6 +829,7 @@ mod imp {
             "Ready to apply update {}.",
             format_version_for_display(update_label)
         );
+        println!("Kaku will quit and relaunch; running tasks will stop.");
         print!("Press Enter to continue, any other key to cancel. ");
         io::stdout()
             .flush()
@@ -989,6 +1000,54 @@ mod imp {
             assert_eq!(
                 strip_html_tags("1. **System Proxy**: works"),
                 "1. **System Proxy**: works"
+            );
+        }
+
+        /// Guard the multi-entry update matrix: every provider that replaces
+        /// the running app must call `confirm_apply_update` before the
+        /// destructive step. Catches the brew sibling of the menu-confirm fix.
+        #[test]
+        fn brew_and_direct_paths_confirm_before_replace() {
+            let src = include_str!("update.rs");
+
+            assert!(
+                src.contains("run_brew_upgrade(&info, assume_yes)"),
+                "brew provider must thread assume_yes into run_brew_upgrade"
+            );
+
+            let brew_fn = src
+                .split("fn run_brew_upgrade")
+                .nth(1)
+                .expect("run_brew_upgrade present");
+            let brew_body = brew_fn
+                .split("fn resolve_latest_tag_from_redirect")
+                .next()
+                .expect("brew function body");
+            let confirm_at = brew_body
+                .find("confirm_apply_update")
+                .expect("run_brew_upgrade must confirm before upgrading");
+            let upgrade_at = brew_body
+                .find(".arg(\"upgrade\")")
+                .expect("run_brew_upgrade must invoke brew upgrade");
+            assert!(
+                confirm_at < upgrade_at,
+                "confirm_apply_update must run before brew upgrade"
+            );
+
+            let direct_confirm = src
+                .find("if !confirm_apply_update(update_label, assume_yes)?")
+                .expect("direct path must confirm before install");
+            let direct_spawn = src
+                .find("spawn_update_helper(&helper_script, &target_app, &new_app_path, &work_dir)")
+                .expect("direct path must spawn helper");
+            assert!(
+                direct_confirm < direct_spawn,
+                "direct path must confirm before spawning the replace helper"
+            );
+
+            assert!(
+                src.contains("Kaku will quit and relaunch; running tasks will stop."),
+                "CLI confirm copy must warn about quit and lost tasks"
             );
         }
     }
