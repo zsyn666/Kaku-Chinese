@@ -797,7 +797,7 @@ impl super::TermWindow {
                     }
                 }
 
-                computed_kids.sort_by(|a, b| a.zindex.cmp(&b.zindex));
+                computed_kids.sort_by_key(|kid| kid.zindex);
 
                 let content_rect = euclid::rect(0., 0., max_x.min(max_width), pixel_height);
                 let rects = element.compute_rects(context, content_rect);

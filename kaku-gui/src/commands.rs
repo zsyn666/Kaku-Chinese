@@ -250,6 +250,7 @@ impl CommandDef {
             ToggleAllPanesInputBroadcast,
             MoveTabRelative(-1),
             MoveTabRelative(1),
+            MoveTabToNewWindow,
             TogglePaneZoomState,
             ShowTabNavigator,
             // Help menu
@@ -1954,6 +1955,17 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Kaku"],
             icon: None,
         },
+        MoveTabToNewWindow => CommandDef {
+            brief: "Move Tab to New Window".into(),
+            doc: "Move the current tab, and every pane in it, to a new window".into(),
+            // No default shortcut: every Cmd/Ctrl+letter combination worth
+            // having here is already spoken for, and a menu keyEquivalent can
+            // swallow the same chord from raw-mode TUIs.
+            keys: vec![],
+            args: &[ArgType::ActiveTab],
+            menubar: &["Window"],
+            icon: None,
+        },
         MoveTabRelative(-1) => CommandDef {
             brief: "Move Tab Left".into(),
             doc: "Move current tab left".into(),
@@ -2811,6 +2823,7 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         ActivateWindowRelative(1),
         MoveTabRelative(-1),
         MoveTabRelative(1),
+        MoveTabToNewWindow,
         AdjustPaneSize(PaneDirection::Left, 5),
         AdjustPaneSize(PaneDirection::Right, 5),
         AdjustPaneSize(PaneDirection::Up, 5),
@@ -2887,6 +2900,30 @@ mod tests {
         assert!(CommandDef::default_key_assignments(&config)
             .iter()
             .any(|(_, _, action)| *action == KeyAssignment::ToggleAllPanesInputBroadcast));
+    }
+
+    #[test]
+    fn move_tab_to_new_window_has_no_default_shortcut() {
+        let cmd = derive_command_from_key_assignment(&KeyAssignment::MoveTabToNewWindow)
+            .expect("command");
+
+        assert_eq!(cmd.brief, "Move Tab to New Window");
+        assert_eq!(cmd.menubar, &["Window"]);
+        // A Cmd/Ctrl+letter keyEquivalent here would be intercepted by AppKit
+        // before raw-mode TUIs ever see the chord, so this stays menu-only.
+        assert!(cmd.keys.is_empty());
+    }
+
+    #[test]
+    fn move_tab_to_new_window_is_reachable_from_palette_and_menubar() {
+        let config = ConfigHandle::default_config();
+
+        assert!(CommandDef::actions_for_palette_only(&config)
+            .iter()
+            .any(|cmd| cmd.action == KeyAssignment::MoveTabToNewWindow));
+        assert!(CommandDef::actions_for_palette_and_menubar(&config)
+            .iter()
+            .any(|cmd| cmd.action == KeyAssignment::MoveTabToNewWindow && !cmd.menubar.is_empty()));
     }
 
     #[test]

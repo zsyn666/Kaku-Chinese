@@ -74,3 +74,7 @@
 31	github.com 这类不带协议前缀的裸域名现在也可以 Cmd+Click 打开
 31	Option+Click moves the shell cursor within the current input line
 31	Option+Click 可在当前输入行内移动光标
+32	The current tab, panes and all, can move to a new window from the command palette or the Window menu
+32	命令面板或 Window 菜单可以把当前标签页连同分屏整个移到新窗口
+32	Dragging a window between displays no longer leaves its title bar stuck behind the menu bar
+32	跨显示器拖动窗口时，标题栏不会再卡在菜单栏后面

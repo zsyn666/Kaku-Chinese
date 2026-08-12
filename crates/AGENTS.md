@@ -18,17 +18,11 @@ Key groups:
 
 ## Practical Rules
 
-- Keep each crate focused and small in scope.
 - Prefer reusing existing workspace crates before adding new ones.
 - Preserve public API stability for cross-crate consumers.
 - For macOS notification actions that launch Kaku commands, prefer resolving bundled executables relative to the running `kaku-gui` binary.
 - Keep `kaku-ai-utils` provider-agnostic; provider policy belongs in GUI/CLI call sites and config, not in low-level helpers.
 - When shared cache helpers affect startup, verify the GUI consumer and avoid invalidating hot-path caches unnecessarily.
-
-## Notes
-
-- Not every crate needs deep inspection for each task.
-- Start from call-sites in top-level crates, then dive into utilities as needed.
 
 ## Cross-References
 

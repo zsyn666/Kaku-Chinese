@@ -1011,25 +1011,27 @@ impl Modal for CommandPalette {
 
         match event.button {
             wezterm_term::MouseButton::WheelUp(lines) => {
-                if self.move_by(-Self::smooth_wheel_steps(lines)) {
+                let moved = self.move_by(-Self::smooth_wheel_steps(lines));
+                if moved {
                     if let Some(window) = term_window.window.as_ref() {
                         window.invalidate();
                     }
                 }
             }
             wezterm_term::MouseButton::WheelDown(lines) => {
-                if self.move_by(Self::smooth_wheel_steps(lines)) {
+                let moved = self.move_by(Self::smooth_wheel_steps(lines));
+                if moved {
                     if let Some(window) = term_window.window.as_ref() {
                         window.invalidate();
                     }
                 }
             }
             wezterm_term::MouseButton::Left => {
-                if event.kind == wezterm_term::MouseEventKind::Press
+                let pressed_on_row = event.kind == wezterm_term::MouseEventKind::Press
                     && self
                         .pick_row_from_point(abs_x, abs_y, term_window)
-                        .is_some()
-                {
+                        .is_some();
+                if pressed_on_row {
                     // Note: activate_selected returns false on failure, but the modal
                     // dismissal and error toast are handled internally. We intentionally
                     // don't propagate the failure here as the UI already gave feedback.

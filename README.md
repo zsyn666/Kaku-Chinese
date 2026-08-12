@@ -74,7 +74,7 @@ Run `kaku ai` to configure the assistant fields directly:
 
 | Field | Use |
 | :--- | :--- |
-| Auth Type | API key or Codex CLI login |
+| Auth Type | API key or Follow Codex user connection |
 | Simple Model | Lightweight command generation and quick chat model |
 | Deep Model | Primary `Cmd + L` / `k` chat model |
 | Base URL | OpenAI-compatible API root, such as `https://api.openai.com/v1` |
@@ -141,4 +141,4 @@ Big thanks to all contributors who helped build Kaku. Go follow them! ❤️
 
 GNU General Public License v3.0 — see [LICENSE](LICENSE) for details.
 
-This is a fork of [Kaku](https://github.com/tw93/Kaku) (MIT) by [tw93](https://github.com/tw93). The original MIT-licensed code remains under its terms; new modifications and the combined work are distributed under GPLv3.
+This is a fork of [Kaku](https://github.com/tw93/Kaku) (MIT) by [tw93](https://github.com/tw93). The original MIT-licensed code remains under its terms; new modifications and the combined work are distributed under GPLv3. Attribution for WezTerm and the bundled fonts is in [NOTICE.md](NOTICE.md).

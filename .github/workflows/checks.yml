@@ -88,7 +88,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -164,7 +164,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -175,6 +175,9 @@ jobs:
             echo "ERROR: write/flush must not silently ignore errors in core crates"
             exit 1
           fi
+
+      - name: Guard toolchain pin consistency
+        run: ./scripts/check_toolchain_pins.sh
 
       - name: Guard production logging discipline
         run: ./scripts/check_logs.sh
@@ -195,7 +198,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
@@ -221,7 +224,7 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
-          toolchain: 1.93.0
+          toolchain: 1.95.0
           components: clippy
 
       - name: Cache Cargo

@@ -692,7 +692,8 @@ impl LauncherState {
                     key: KeyCode::Escape,
                     ..
                 }) => {
-                    if !self.exit_submenu() {
+                    let left_submenu = self.exit_submenu();
+                    if !left_submenu {
                         break;
                     }
                 }
@@ -736,7 +737,8 @@ impl LauncherState {
                 InputEvent::Mouse(MouseEvent {
                     y, mouse_buttons, ..
                 }) => {
-                    if y > 0 && y as usize <= self.filtered_entries.len() {
+                    let on_entry_row = y > 0 && y as usize <= self.filtered_entries.len();
+                    if on_entry_row {
                         self.active_idx = self.top_row + y as usize - 1;
 
                         if mouse_buttons == MouseButtons::LEFT {

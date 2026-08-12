@@ -1132,6 +1132,12 @@ impl App {
                 // rather than silently switching to index 0.
                 let saved =
                     crate::ai_state::load_last_model().unwrap_or_else(|| self.current_model());
+                if saved == crate::codex_connection::FOLLOW_CODEX_MODEL {
+                    self.available_models = list;
+                    self.model_index = 0;
+                    self.model_fetch = ModelFetch::Loaded;
+                    return true;
+                }
                 match list.iter().position(|m| m == &saved) {
                     Some(idx) => {
                         self.available_models = list;

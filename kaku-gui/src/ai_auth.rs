@@ -19,8 +19,12 @@ pub fn copilot_auth_file_path() -> Option<PathBuf> {
     Some(config_dir.join("copilot_auth.json"))
 }
 
+pub(crate) fn codex_home_dir() -> PathBuf {
+    kaku_ai_utils::codex_home_dir(&config::HOME_DIR)
+}
+
 fn codex_auth_file_path() -> PathBuf {
-    config::HOME_DIR.join(".codex").join("auth.json")
+    codex_home_dir().join("auth.json")
 }
 
 // ─── Copilot auth ─────────────────────────────────────────────────────────────
@@ -259,8 +263,12 @@ fn decode_jwt_claims(jwt: &str) -> Option<serde_json::Value> {
 /// to call the Codex backend on the user's behalf.
 pub fn read_codex_auth() -> Option<CodexAuth> {
     let v = read_codex_auth_json()?;
-    let access_token = codex_access_token_from(&v)?;
-    let account_id = codex_account_id_from(&v);
+    codex_auth_from_value(&v)
+}
+
+pub(crate) fn codex_auth_from_value(v: &serde_json::Value) -> Option<CodexAuth> {
+    let access_token = codex_access_token_from(v)?;
+    let account_id = codex_account_id_from(v);
     Some(CodexAuth {
         access_token,
         account_id,

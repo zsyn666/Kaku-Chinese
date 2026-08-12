@@ -278,7 +278,7 @@ pub fn save_active_messages(active_id: &str, messages: &[PersistedMessage]) -> R
         entry.message_count = messages.len();
     }
     idx.conversations
-        .sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+        .sort_by_key(|entry| std::cmp::Reverse(entry.updated_at));
     save_index_to(&idx, &dir)
 }
 

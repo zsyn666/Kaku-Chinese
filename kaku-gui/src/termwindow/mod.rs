@@ -2621,8 +2621,8 @@ impl TermWindow {
         let overlay_panes_to_cancel = self
             .pane_state
             .borrow()
-            .iter()
-            .filter_map(|(_, state)| state.overlay.as_ref().map(|overlay| overlay.pane.pane_id()))
+            .values()
+            .filter_map(|state| state.overlay.as_ref().map(|overlay| overlay.pane.pane_id()))
             .collect::<Vec<_>>();
 
         for pane_id in overlay_panes_to_cancel {
@@ -3906,6 +3906,51 @@ impl TermWindow {
         Ok(())
     }
 
+    /// Move the active tab into a window of its own, panes and all.
+    ///
+    /// `PaneSelect(MoveToNewWindow)` only relocates a single pane, so a split
+    /// tab cannot be detached without taking it apart first. The tab itself is
+    /// just an `Arc<Tab>` moving between windows: the PTYs, scrollback and
+    /// title ride along untouched.
+    fn move_tab_to_new_window(&mut self) -> anyhow::Result<()> {
+        let mux = Mux::get();
+
+        let (tab, workspace) = {
+            let mut window = mux
+                .get_window_mut(self.mux_window_id)
+                .ok_or_else(|| anyhow!("no such window"))?;
+
+            // A lone tab already owns its window. Detaching it would prune the
+            // source window and rebuild an identical one, which reads to the
+            // user as the window randomly jumping.
+            ensure!(window.len() > 1, "window has only one tab");
+
+            let active = window.get_active_idx();
+            let workspace = window.get_workspace().to_string();
+            (window.remove_by_idx(active), workspace)
+        };
+
+        let builder = mux.new_empty_window(Some(workspace), None);
+        let new_window_id = *builder;
+        if let Err(err) = mux.add_tab_to_window(&tab, new_window_id) {
+            // Never strand a tab: put it back before giving up, and drop the
+            // window we speculatively created rather than leaving it empty.
+            if let Some(mut window) = mux.get_window_mut(self.mux_window_id) {
+                window.push(&tab);
+            }
+            builder.cancel();
+            return Err(err);
+        }
+        // Dropping the builder fires WindowCreated, which is what makes the GUI
+        // materialize the new window.
+        drop(builder);
+
+        self.update_title();
+        self.update_scrollbar();
+
+        Ok(())
+    }
+
     /// Compute render offsets for all tabs (dragged + animated)
     pub fn compute_tab_render_offsets(&mut self) -> HashMap<usize, f32> {
         let mut offsets = HashMap::new();
@@ -4656,6 +4701,7 @@ impl TermWindow {
                 refresh_fast_config_snapshot();
             }
             MoveTab(n) => self.move_tab(*n)?,
+            MoveTabToNewWindow => self.move_tab_to_new_window()?,
             MoveTabRelative(n) => self.move_tab_relative(*n)?,
             ScrollByPage(n) => self.scroll_by_page(**n, pane)?,
             ScrollByLine(n) => self.scroll_by_line(*n, pane)?,

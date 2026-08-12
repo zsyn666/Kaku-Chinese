@@ -180,17 +180,15 @@ impl TmuxDomainState {
                     self.subscribe_notification();
                     log::info!("tmux session changed:{}", session);
                 }
-                Event::WindowAdd { window } => {
-                    // Only handle the new tab, the first empty window handled by sync_window_state
-                    if !self.gui_window.lock().is_none() {
-                        if let Some(session) = *self.tmux_session.lock() {
-                            let mut cmd_queue = self.cmd_queue.as_ref().lock();
-                            cmd_queue.push_back(Box::new(ListAllWindows {
-                                session_id: session,
-                                window_id: Some(*window),
-                            }));
-                            log::info!("tmux window add: {}:{}", session, window);
-                        }
+                // Only handle the new tab, the first empty window handled by sync_window_state
+                Event::WindowAdd { window } if self.gui_window.lock().is_some() => {
+                    if let Some(session) = *self.tmux_session.lock() {
+                        let mut cmd_queue = self.cmd_queue.as_ref().lock();
+                        cmd_queue.push_back(Box::new(ListAllWindows {
+                            session_id: session,
+                            window_id: Some(*window),
+                        }));
+                        log::info!("tmux window add: {}:{}", session, window);
                     }
                 }
                 Event::WindowClose { window } => {

@@ -23,7 +23,7 @@ make app
 ./scripts/check_config_release_readiness.sh
 ```
 
-`make fmt` requires nightly Rust. Use `make app` when the change touches GUI, rendering, windowing, input, or AI overlay behavior.
+`make fmt` and `make fmt-check` both run `cargo +nightly fmt`, so both require the nightly toolchain. Use `make app` when the change touches GUI, rendering, windowing, input, or AI overlay behavior.
 
 ## Project-Specific Rules
 

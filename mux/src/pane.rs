@@ -588,33 +588,25 @@ pub fn impl_get_logical_lines_via_get_lines<P: Pane + ?Sized>(
     }
 
     // Now process this stuff into logical lines
-    let mut lines = vec![];
+    let mut lines: Vec<LogicalLine> = vec![];
     for (idx, line) in phys.into_iter().enumerate() {
         match lines.last_mut() {
-            None => {
+            Some(prior)
+                if prior.logical.last_cell_was_wrapped()
+                    && prior.logical.len() <= MAX_LOGICAL_LINE_LEN =>
+            {
+                let seqno = prior.logical.current_seqno().max(line.current_seqno());
+                prior.logical.set_last_cell_was_wrapped(false, seqno);
+                prior.logical.append_line(line.clone(), seqno);
+                prior.physical_lines.push(line);
+            }
+            _ => {
                 let logical = line.clone();
                 lines.push(LogicalLine {
                     physical_lines: vec![line],
                     logical,
                     first_row: first + idx as StableRowIndex,
                 });
-            }
-            Some(prior) => {
-                if prior.logical.last_cell_was_wrapped()
-                    && prior.logical.len() <= MAX_LOGICAL_LINE_LEN
-                {
-                    let seqno = prior.logical.current_seqno().max(line.current_seqno());
-                    prior.logical.set_last_cell_was_wrapped(false, seqno);
-                    prior.logical.append_line(line.clone(), seqno);
-                    prior.physical_lines.push(line);
-                } else {
-                    let logical = line.clone();
-                    lines.push(LogicalLine {
-                        physical_lines: vec![line],
-                        logical,
-                        first_row: first + idx as StableRowIndex,
-                    });
-                }
             }
         }
     }

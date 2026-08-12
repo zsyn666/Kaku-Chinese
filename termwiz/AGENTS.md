@@ -14,11 +14,7 @@
 ## Practical Rules
 
 - Keep primitives generic; do not leak Kaku-specific policy into reusable widgets.
-- Prefer existing widget contracts over one-off UI behavior.
 - Preserve keyboard navigation and terminal rendering compatibility.
-- Add targeted tests when widget state or input behavior changes.
-- Reuse existing form, theme, and component primitives for both config TUI and AI config TUI.
-- Keep debounce and terminal repaint behavior in shared primitives rather than duplicating it in feature-specific TUI code.
 
 ## Verification
 

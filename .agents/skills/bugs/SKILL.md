@@ -46,7 +46,7 @@ Highest historical yield first. Subsystem guides live in crate `AGENTS.md` files
 
 | Boundary | What to ask | Where it usually lives |
 |---|---|---|
-| Multi-entry destructive actions | Menu, toast, CLI, shell, key binding: do they all confirm the same way before quit/replace/kill? | `kaku-gui/src/frontend.rs`, `update.rs`, `overlay/confirm_*.rs`, `kaku/src/update.rs` |
+| Multi-entry destructive actions | Menu, toast, CLI, shell, key binding: do they all confirm the same way before quit/replace/kill? | `kaku-gui/src/frontend.rs`, `update.rs`, `overlay/confirm.rs`, `overlay/confirm_close_pane.rs`, `kaku/src/update.rs` |
 | macOS window geometry | Traffic lights vs tab bar, DPI scale, external display drag, sleep/wake, lock screen, fullscreen first frame | `window/src/os/macos/`, `kaku-gui/src/termwindow/resize.rs`, titlebar paint |
 | Tab chrome | Overflow hit targets, rename modal selection, multi-pane title width, top vs bottom bar | `kaku-gui/src/tabbar.rs`, `termwindow/tab_rename.rs` |
 | Selection / mouse state | Survives Ctrl+L, modal cancel, mouse-reporting panes, successful terminal input? | `kaku-gui/src/termwindow/selection.rs`, mouseevent |

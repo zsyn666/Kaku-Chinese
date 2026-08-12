@@ -1303,7 +1303,8 @@ impl super::TermWindow {
                 | TabBarItem::NewTabButton { .. } => {}
             },
             WMEK::VertWheel(n) => {
-                if self.config.mouse_wheel_scrolls_tabs {
+                let scrolls_tabs = self.config.mouse_wheel_scrolls_tabs;
+                if scrolls_tabs {
                     if let Err(err) = self.activate_tab_relative(if n < 1 { 1 } else { -1 }, true) {
                         log::debug!("activate_tab_relative on wheel failed: {err:#}");
                     }

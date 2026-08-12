@@ -18,10 +18,10 @@ use crate::assistant_config;
 use crate::utils::write_atomic;
 
 use super::{
-    assistant_model_options_for_config_remote, decode_jwt_payload_with_debug,
+    assistant_model_options_for_config_remote, codex_home_dir, decode_jwt_payload_with_debug,
     extract_antigravity_fields, extract_kaku_assistant_fields_with_model_options,
     kimi_credentials_path, parse_kaku_assistant_config, read_codex_model_options,
-    read_json_file_with_debug, FieldEntry, Tool,
+    read_json_file_with_debug, FieldEntry, Tool, FOLLOW_CODEX_MODEL,
 };
 
 const USAGE_CACHE_TTL: Duration = Duration::from_secs(120);
@@ -139,7 +139,7 @@ pub(super) fn antigravity_state_db_path() -> PathBuf {
 }
 
 pub(super) fn read_codex_auth_info() -> Option<(String, String)> {
-    let auth_path = config::HOME_DIR.join(".codex").join("auth.json");
+    let auth_path = codex_home_dir().join("auth.json");
     let auth_json = read_json_file_with_debug(&auth_path, "codex auth status")?;
 
     let access_token = auth_json
@@ -1281,9 +1281,14 @@ pub(super) fn load_usage_update(tool: Tool) -> UsageSummaryUpdate {
             };
             let raw = std::fs::read_to_string(&path).unwrap_or_default();
             let cfg = parse_kaku_assistant_config(&raw);
-            // codex has no api_key/base_url to query; use its CLI model catalog.
+            // Codex following mode uses the CLI model catalog rather than
+            // assistant.toml's api_key/base_url model endpoint.
             let model_options = if cfg.auth_type() == "codex" {
-                read_codex_model_options()
+                let mut options = read_codex_model_options();
+                if !options.iter().any(|option| option == FOLLOW_CODEX_MODEL) {
+                    options.insert(0, FOLLOW_CODEX_MODEL.to_string());
+                }
+                options
             } else {
                 assistant_model_options_for_config_remote(&cfg)
             };

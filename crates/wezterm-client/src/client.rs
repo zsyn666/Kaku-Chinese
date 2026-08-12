@@ -1320,7 +1320,7 @@ impl Client {
                 } else {
                     let mut clients = self.list_clients().await?.clients;
                     clients.retain(|client| client.focused_pane_id.is_some());
-                    clients.sort_by(|a, b| b.last_input.cmp(&a.last_input));
+                    clients.sort_by_key(|client| std::cmp::Reverse(client.last_input));
                     if clients.is_empty() {
                         anyhow::bail!(
                             "--pane-id was not specified and $WEZTERM_PANE

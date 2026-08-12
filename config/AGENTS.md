@@ -24,11 +24,9 @@ The `config` crate owns config loading, Lua integration, schema behavior, proxy 
 
 The config TUI is the interactive terminal UI for editing Kaku config. It lives in the `kaku` CLI crate, not the `config` crate.
 
-- `kaku/src/config_tui/` - TUI app: `app.rs` (main loop), `state.rs` (form state), `ui.rs` (rendering)
-- `kaku/src/tui_core/` - Reusable TUI primitives: `form.rs`, `theme.rs`, `components/` (text_input, select_box, toggle, list_editor)
-- The split between `config_tui` (domain-specific) and `tui_core` (generic components) is intentional; do not merge them back.
-- `tui_core` is designed to be reused by `ai_config/tui/` and any future TUI flows.
-- Debounce logic lives in `tui_core` and should not be duplicated in `config_tui`.
+- `kaku/src/config_tui/` - TUI app: `mod.rs` (form state and main loop), `ui.rs` (rendering)
+- `kaku/src/tui_core/` - shared TUI primitives, currently `theme.rs` only (`accent`, `bg`, `muted`, `panel`, `primary`, `red`, `success`, `text_fg`)
+- `tui_core::theme` is consumed by `config_tui/ui.rs`, `ai_config/tui/ui.rs`, and `tui_splash.rs`. New primitives shared by more than one TUI flow belong in `tui_core`, not copied per feature.
 
 ## AI Config TUI (`kaku/src/ai_config/`)
 
@@ -43,7 +41,7 @@ The AI config TUI lives in the `kaku` CLI crate and shares terminal UI primitive
 - Loading priority: user config first, bundled config second.
 - Keep reload-safe behavior for startup hooks and subscriptions.
 - Avoid introducing config paths that bypass existing precedence rules.
-- Do not reintroduce `KAKU_CONFIG_FILE`; config path override was intentionally removed.
+- `KAKU_CONFIG_FILE` is an output, not an input. Config loading exports it (`config/src/config.rs`) and `effective_config_file_path()` (`config/src/lib.rs`), the GUI single-instance check (`kaku-gui/src/main.rs`), `assets/shell-integration/setup_{zsh,fish}.sh`, and the bundled `kaku.lua` all read it back. Do not turn it into a config path override; the only supported override is `--config-file` (`CONFIG_FILE_OVERRIDE`).
 - Keep bundled fallback config authoritative at `assets/macos/Kaku.app/Contents/Resources/kaku.lua`.
 - Preserve compatibility with runtime reload callers that trigger `config::reload()` from GUI-side signals.
 - The current `config_version` is whatever `assets/shell-integration/config_version.txt` says; never trust a number written in a doc (this line once said 24 while the release was at 26). Any version bump must update bundled config, release checks, docs, and migration expectations together, and add a row to `docs/config-versions.md`.

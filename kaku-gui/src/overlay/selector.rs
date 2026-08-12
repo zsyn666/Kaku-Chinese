@@ -370,7 +370,8 @@ impl SelectorState {
                     key: KeyCode::Enter,
                     ..
                 }) => {
-                    if self.launch(self.active_idx) {
+                    let launched = self.launch(self.active_idx);
+                    if launched {
                         break;
                     }
                 }

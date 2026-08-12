@@ -133,13 +133,12 @@ fn run_app(
                 KeyCode::Right => {
                     app.edit_cursor_right();
                 }
-                KeyCode::Char(c) => {
-                    // Ignore characters with Ctrl/Cmd modifiers to avoid inserting escape sequences
+                // Ignore characters with Ctrl/Cmd modifiers to avoid inserting escape sequences
+                KeyCode::Char(c)
                     if !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && !key.modifiers.contains(KeyModifiers::SUPER)
-                    {
-                        app.edit_insert(c);
-                    }
+                        && !key.modifiers.contains(KeyModifiers::SUPER) =>
+                {
+                    app.edit_insert(c);
                 }
                 _ => {}
             },

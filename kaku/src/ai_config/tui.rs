@@ -27,6 +27,12 @@ mod ui;
 
 use providers::*;
 
+const FOLLOW_CODEX_MODEL: &str = "Follow Codex";
+
+fn codex_home_dir() -> PathBuf {
+    kaku_ai_utils::codex_home_dir(&config::HOME_DIR)
+}
+
 #[derive(Clone, Copy, PartialEq)]
 pub(crate) enum Tool {
     KakuAssistant,
@@ -65,7 +71,7 @@ impl Tool {
                     .join("assistant.toml")
             }),
             Tool::ClaudeCode => home.join(".claude").join("settings.json"),
-            Tool::Codex => home.join(".codex").join("config.toml"),
+            Tool::Codex => codex_home_dir().join("config.toml"),
             Tool::Kimi => home.join(".kimi").join("config.toml"),
             Tool::Antigravity => home
                 .join("Library")
@@ -211,7 +217,7 @@ impl ToolState {
         };
 
         let extra_exists = match tool {
-            Tool::Codex => config::HOME_DIR.join(".codex").join("auth.json").exists(),
+            Tool::Codex => codex_home_dir().join("auth.json").exists(),
             Tool::Kimi => config::HOME_DIR
                 .join(".kimi")
                 .join("credentials")
@@ -380,7 +386,7 @@ fn summarize_tool_fields(
         // codex is "ready" when the CLI is logged in (no API key needed);
         // api_key auth needs a key present.
         let ready = if field_value(fields, "Auth Type") == Some("codex") {
-            read_codex_auth_info().is_some()
+            codex_connection_is_configured()
         } else {
             field_value(fields, "API Key").is_some_and(|value| value != "-")
         };
@@ -1163,7 +1169,7 @@ fn extract_kaku_assistant_fields_with_model_options(
         FieldEntry {
             key: "Auth Type".into(),
             value: auth_type.to_string(),
-            // api_key = paste a key; codex = reuse the `codex` CLI login.
+            // api_key = configure Kaku directly; codex = follow the user Codex connection.
             options: vec!["api_key".into(), "codex".into()],
             editable: true,
         },
@@ -1201,8 +1207,8 @@ fn extract_kaku_assistant_fields_with_model_options(
         },
     ]);
 
-    // codex talks to a fixed Responses backend and reuses the CLI OAuth login,
-    // so neither Base URL nor API Key applies there.
+    // Codex follows the user Codex provider, so assistant.toml's Base URL and
+    // API Key do not apply there.
     if !is_codex {
         fields.push(FieldEntry {
             key: "Base URL".into(),
@@ -1247,7 +1253,11 @@ fn extract_kaku_assistant_fields(raw: &str) -> Vec<FieldEntry> {
     let cfg = parse_kaku_assistant_config(raw);
     // codex's own model catalog (from the CLI cache), not the OpenAI-API list.
     let model_options = if cfg.auth_type() == "codex" {
-        read_codex_model_options()
+        let mut options = read_codex_model_options();
+        if !options.iter().any(|option| option == FOLLOW_CODEX_MODEL) {
+            options.insert(0, FOLLOW_CODEX_MODEL.to_string());
+        }
+        options
     } else {
         assistant_model_options_for_config(&cfg)
     };
@@ -1571,36 +1581,48 @@ fn save_kaku_assistant_field_to_path(
                 .with_chat_model_passthrough(&cfg)
         }
         "Auth Type" if new_val.trim() == "codex" => {
-            // The OpenAI-API models (e.g. gpt-5.4-mini) are not valid on the Codex
-            // backend, so default both models to a Codex model unless the current
-            // value already is one.
-            let codex_models = read_codex_model_options();
-            let default_model = codex_models
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "gpt-5-codex".to_string());
-            let is_codex_model = |m: &str| codex_models.iter().any(|c| c == m);
-            let model = if is_codex_model(cfg.model()) {
-                cfg.model().to_string()
+            let simple_model = if cfg.model() == assistant_config::DEFAULT_MODEL {
+                FOLLOW_CODEX_MODEL
             } else {
-                default_model.clone()
+                cfg.model()
             };
-            let chat_model = if !cfg.chat_model().is_empty() && is_codex_model(cfg.chat_model()) {
-                cfg.chat_model().to_string()
+            let chat_model = if cfg.chat_model() == assistant_config::DEFAULT_CHAT_MODEL {
+                FOLLOW_CODEX_MODEL
             } else {
-                default_model
+                cfg.chat_model()
             };
-            KakuAssistantConfig::new(cfg.is_enabled(), cfg.api_key(), &model, cfg.base_url())
-                .with_custom_headers(cfg.custom_headers().to_vec())
-                .with_chat_model(&chat_model)
-                .with_web_search(cfg.web_search_provider(), cfg.web_search_api_key())
-                .with_chat_model_choices_passthrough(&cfg)
+            KakuAssistantConfig::new(
+                cfg.is_enabled(),
+                cfg.api_key(),
+                simple_model,
+                cfg.base_url(),
+            )
+            .with_custom_headers(cfg.custom_headers().to_vec())
+            .with_chat_model(chat_model)
+            .with_web_search(cfg.web_search_provider(), cfg.web_search_api_key())
+            .with_chat_model_choices_passthrough(&cfg)
         }
         "Auth Type" => {
-            KakuAssistantConfig::new(cfg.is_enabled(), cfg.api_key(), cfg.model(), cfg.base_url())
-                .with_custom_headers(cfg.custom_headers().to_vec())
-                .with_web_search(cfg.web_search_provider(), cfg.web_search_api_key())
-                .with_chat_model_passthrough(&cfg)
+            let simple_model = if cfg.model() == FOLLOW_CODEX_MODEL {
+                assistant_config::DEFAULT_MODEL
+            } else {
+                cfg.model()
+            };
+            let chat_model = if cfg.chat_model() == FOLLOW_CODEX_MODEL {
+                assistant_config::DEFAULT_CHAT_MODEL
+            } else {
+                cfg.chat_model()
+            };
+            KakuAssistantConfig::new(
+                cfg.is_enabled(),
+                cfg.api_key(),
+                simple_model,
+                cfg.base_url(),
+            )
+            .with_custom_headers(cfg.custom_headers().to_vec())
+            .with_web_search(cfg.web_search_provider(), cfg.web_search_api_key())
+            .with_chat_model(chat_model)
+            .with_chat_model_choices_passthrough(&cfg)
         }
         _ => return Ok(()),
     };
@@ -1655,7 +1677,7 @@ fn get_gemini_account() -> Option<String> {
 /// `auth.json`. Plan is `None` for non-ChatGPT-tied tokens (e.g. enterprise
 /// API keys) so the caller can omit the trailing "· Plan" suffix.
 fn get_codex_account() -> Option<(String, Option<String>)> {
-    let auth_path = config::HOME_DIR.join(".codex").join("auth.json");
+    let auth_path = codex_home_dir().join("auth.json");
     let auth_json = read_json_file_with_debug(&auth_path, "codex account")?;
 
     let token = auth_json.get("tokens")?.get("access_token")?.as_str()?;
@@ -1677,6 +1699,168 @@ fn get_codex_account() -> Option<(String, Option<String>)> {
         .map(|s| s.to_string());
 
     Some((email, plan))
+}
+
+fn codex_connection_is_configured() -> bool {
+    codex_connection_is_configured_at(&codex_home_dir(), |name| std::env::var(name).ok())
+}
+
+fn codex_connection_is_configured_at<F>(home: &Path, env: F) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    let auth_path = home.join("auth.json");
+    let auth = read_json_file_with_debug(&auth_path, "codex readiness");
+    if auth_path.exists() && auth.is_none() {
+        return false;
+    }
+    let auth_ready = || {
+        let auth = auth.as_ref()?;
+        match auth.get("auth_mode").and_then(|value| value.as_str()) {
+            Some("apikey") | Some("api-key") | Some("api_key") => auth
+                .get("OPENAI_API_KEY")
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty())
+                .then_some(()),
+            Some("chatgpt") => auth
+                .get("tokens")
+                .and_then(|tokens| tokens.get("access_token"))
+                .or_else(|| auth.get("access_token"))
+                .and_then(|value| value.as_str())
+                .is_some_and(|value| !value.trim().is_empty())
+                .then_some(()),
+            _ => None,
+        }
+    };
+
+    let raw = match std::fs::read_to_string(home.join("config.toml")) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return auth_ready().is_some()
+        }
+        Err(_) => return false,
+    };
+    let parsed = match raw.parse::<toml::Value>() {
+        Ok(parsed) => parsed,
+        Err(_) => return false,
+    };
+    for field in [
+        "model",
+        "model_reasoning_effort",
+        "model_reasoning_summary",
+        "openai_base_url",
+        "chatgpt_base_url",
+        "model_provider",
+    ] {
+        if parsed.get(field).is_some_and(|value| !value.is_str()) {
+            return false;
+        }
+    }
+    let provider_id = parsed
+        .get("model_provider")
+        .and_then(|value| value.as_str())
+        .unwrap_or("openai");
+    if provider_id == "openai" {
+        let valid_override = |field: &str| {
+            parsed
+                .get(field)
+                .and_then(|value| value.as_str())
+                .is_none_or(codex_base_url_is_valid)
+        };
+        return valid_override("openai_base_url")
+            && valid_override("chatgpt_base_url")
+            && auth_ready().is_some();
+    }
+    let Some(provider) = parsed
+        .get("model_providers")
+        .and_then(|value| value.get(provider_id))
+        .and_then(|value| value.as_table())
+    else {
+        return false;
+    };
+    if ["experimental_bearer_token", "aws", "auth"]
+        .iter()
+        .any(|field| provider.contains_key(*field))
+    {
+        return false;
+    }
+    if provider
+        .get("wire_api")
+        .is_some_and(|value| value.as_str() != Some("responses"))
+    {
+        return false;
+    }
+    let Some(base_url) = provider.get("base_url").and_then(|value| value.as_str()) else {
+        return false;
+    };
+    if !codex_base_url_is_valid(base_url)
+        || !codex_string_table_is_valid(provider.get("http_headers"))
+        || !codex_string_table_is_valid(provider.get("query_params"))
+        || !codex_env_header_table_is_ready(provider.get("env_http_headers"), &env)
+        || !codex_optional_retry_is_valid(provider.get("request_max_retries"))
+        || !codex_optional_retry_is_valid(provider.get("stream_max_retries"))
+        || !codex_optional_non_negative_integer_is_valid(provider.get("stream_idle_timeout_ms"))
+    {
+        return false;
+    }
+    let requires_openai_auth = match provider.get("requires_openai_auth") {
+        Some(value) => match value.as_bool() {
+            Some(value) => value,
+            None => return false,
+        },
+        None => false,
+    };
+    if let Some(env_key) = provider.get("env_key") {
+        let Some(env_key) = env_key.as_str() else {
+            return false;
+        };
+        return env(env_key).is_some_and(|value| !value.is_empty());
+    }
+    if requires_openai_auth {
+        return auth_ready().is_some();
+    }
+    true
+}
+
+fn codex_base_url_is_valid(value: &str) -> bool {
+    url::Url::parse(value)
+        .is_ok_and(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
+}
+
+fn codex_string_table_is_valid(value: Option<&toml::Value>) -> bool {
+    value.is_none_or(|value| {
+        value
+            .as_table()
+            .is_some_and(|table| table.values().all(toml::Value::is_str))
+    })
+}
+
+fn codex_env_header_table_is_ready<F>(value: Option<&toml::Value>, env: &F) -> bool
+where
+    F: Fn(&str) -> Option<String>,
+{
+    value.is_none_or(|value| {
+        value.as_table().is_some_and(|table| {
+            table.values().all(|value| {
+                value
+                    .as_str()
+                    .and_then(env)
+                    .is_some_and(|value| !value.is_empty())
+            })
+        })
+    })
+}
+
+fn codex_optional_non_negative_integer_is_valid(value: Option<&toml::Value>) -> bool {
+    value.is_none_or(|value| value.as_integer().is_some_and(|value| value >= 0))
+}
+
+fn codex_optional_retry_is_valid(value: Option<&toml::Value>) -> bool {
+    value.is_none_or(|value| {
+        value
+            .as_integer()
+            .is_some_and(|value| (0..=10).contains(&value))
+    })
 }
 
 /// Get GitHub Copilot username from gh CLI
@@ -2105,7 +2289,7 @@ fn extract_codex_fields(raw: &str) -> Vec<FieldEntry> {
     }
 
     // Check auth status from auth.json
-    let auth_path = config::HOME_DIR.join(".codex").join("auth.json");
+    let auth_path = codex_home_dir().join("auth.json");
     if let Some(auth) = read_json_file_with_debug(&auth_path, "codex auth status") {
         let auth_mode = auth.get("auth_mode").and_then(|v| v.as_str()).unwrap_or("");
         if !auth_mode.is_empty() {
@@ -2205,9 +2389,10 @@ fn extract_antigravity_fields(snapshot: Option<&AntigravityUsageSnapshot>) -> Ve
     fields
 }
 
-/// Read model slugs from Codex's own cache, or from models.dev.
+/// Read model slugs from Codex's own cache. A custom provider's catalog must
+/// never be replaced with the generic OpenAI list from models.dev.
 fn read_codex_model_options() -> Vec<String> {
-    let cache_path = config::HOME_DIR.join(".codex").join("models_cache.json");
+    let cache_path = codex_home_dir().join("models_cache.json");
     if let Some(parsed) = read_json_file_with_debug(&cache_path, "codex model cache") {
         let mut models: Vec<(String, usize)> = parsed
             .get("models")
@@ -2235,7 +2420,7 @@ fn read_codex_model_options() -> Vec<String> {
         }
     }
 
-    read_models_dev("openai")
+    Vec::new()
 }
 
 fn extract_gemini_fields(val: &serde_json::Value) -> Vec<FieldEntry> {
@@ -5395,11 +5580,19 @@ provider = "managed:kimi-code"
         );
         // api_key stays in the file even though codex hides it in the UI.
         assert!(saved.contains("api_key = \"sk-keep\""));
+        assert!(saved.contains("model = \"Follow Codex\""));
+        assert!(!saved.contains("chat_model ="));
 
         let fields = extract_kaku_assistant_fields(&saved);
         assert!(fields
             .iter()
             .any(|f| f.key == "Auth Type" && f.value == "codex"));
+        assert!(fields
+            .iter()
+            .any(|f| f.key == "Simple Model" && f.value == FOLLOW_CODEX_MODEL));
+        assert!(fields
+            .iter()
+            .any(|f| f.key == "Deep Model" && f.value == FOLLOW_CODEX_MODEL));
         assert!(
             !fields.iter().any(|f| f.key == "API Key"),
             "API Key field must be hidden under codex auth"
@@ -5420,8 +5613,72 @@ provider = "managed:kimi-code"
         save_kaku_assistant_field_to_path(&path, "Auth Type", "api_key").expect("save api_key");
         let saved2 = std::fs::read_to_string(&path).expect("read saved2");
         assert!(!saved2.contains("auth_type ="));
+        assert!(saved2.contains("model = \"gpt-5.4-mini\""));
         let fields2 = extract_kaku_assistant_fields(&saved2);
         assert!(fields2.iter().any(|f| f.key == "API Key"));
+    }
+
+    #[test]
+    fn kaku_assistant_switch_to_codex_preserves_explicit_model_overrides() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("assistant.toml");
+        std::fs::write(
+            &path,
+            "enabled = true\nmodel = \"provider-fast\"\nchat_model = \"provider-deep\"\nbase_url = \"https://example.com/v1\"\n",
+        )
+        .expect("write temp config");
+
+        save_kaku_assistant_field_to_path(&path, "Auth Type", "codex").expect("save auth type");
+        let saved = std::fs::read_to_string(&path).expect("read saved");
+        assert!(saved.contains("auth_type = \"codex\""));
+        assert!(saved.contains("model = \"provider-fast\""));
+        assert!(saved.contains("chat_model = \"provider-deep\""));
+    }
+
+    #[test]
+    fn codex_readiness_matches_runtime_provider_validation() {
+        let dir = tempdir().expect("tempdir");
+        let config_path = dir.path().join("config.toml");
+        std::fs::write(
+            &config_path,
+            r#"
+model = "custom-chat"
+model_provider = "custom"
+
+[model_providers.custom]
+base_url = "http://127.0.0.1:58424/v1"
+wire_api = "responses"
+env_key = "CUSTOM_TOKEN"
+request_max_retries = 2
+
+[model_providers.custom.env_http_headers]
+x-tenant = "CUSTOM_TENANT"
+"#,
+        )
+        .expect("write Codex config");
+
+        let env = |name: &str| match name {
+            "CUSTOM_TOKEN" => Some("token".to_string()),
+            "CUSTOM_TENANT" => Some("tenant".to_string()),
+            _ => None,
+        };
+        assert!(codex_connection_is_configured_at(dir.path(), env));
+
+        assert!(!codex_connection_is_configured_at(dir.path(), |name| {
+            (name == "CUSTOM_TOKEN").then(|| "token".to_string())
+        }));
+
+        std::fs::write(
+            &config_path,
+            r#"
+model_provider = "custom"
+[model_providers.custom]
+base_url = "not-a-url"
+experimental_bearer_token = "unsafe"
+"#,
+        )
+        .expect("write invalid Codex config");
+        assert!(!codex_connection_is_configured_at(dir.path(), |_| None));
     }
 
     #[test]

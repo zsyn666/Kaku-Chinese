@@ -37,9 +37,7 @@
 
 ## Practical Rules
 
-- Prefer existing helper methods over re-implementing logic inline.
 - Keep rendering decisions in rendering modules, not scattered across event code.
-- Be careful with drag and wheel interactions; regressions are user-visible quickly.
 - Keep initial window dimension math in `TermWindow::new_window()` consistent with `get_os_border()` behavior.
 - In-app update must confirm before replacing the running app. User-facing paths (menu Check for Updates, menu Restart to Update, toast click) go through `check_for_updates_from_menu()` / `confirm_and_apply_update()` in `src/frontend.rs`, not straight to `restart_to_update()`. Exploratory menu check opens a tab without `KAKU_UPDATE_AUTO_CONFIRM`; only the overlay-confirmed path may auto-confirm. CLI direct and brew paths confirm in `kaku/src/update.rs`. Guards: `frontend::tests::user_facing_update_events_route_through_confirm` and `update::imp::tests::brew_and_direct_paths_confirm_before_replace`.
 - Keep `KAKU_CONFIG_CHANGED` fast path in `emit_user_var_event()` before pane ownership checks.

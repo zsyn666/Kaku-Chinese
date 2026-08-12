@@ -56,7 +56,7 @@ macOS 26 上 NSMenu 的 keyEquivalent modifier 匹配并不严格相等。给 me
 
 兜底：任何"模仿系统快捷键"的 menu 项宁可 `keys: vec![]` 不设快捷键，让用户从菜单点。`kaku-gui/src/commands.rs` 里的 keyEquivalent 装配逻辑必须统一从按键候选本身取 modifiers，不要为个别 menu 项走强制 modifier 的特例化路径（历史上的特例化路径已删，不要加回）。
 
-参考历史：`a14b26d` 之后的 CenterWindow 修复（删掉给 Window > Center 装 `Fn+Ctrl+C` keyEquivalent 的特例，因为 macOS 26 把它当 plain Ctrl+C 拦了，导致 raw-mode 下 Ctrl+C 不退 claude/codex）。
+参考历史：`8aba4475` feat(window): add CenterWindow menu without macOS shortcut（Window > Center 刻意不装 keyEquivalent，因为 macOS 26 会把 `Fn+Ctrl+C` 当 plain Ctrl+C 拦了，导致 raw-mode 下 Ctrl+C 不退 claude/codex）。
 
 ### 排查 keyDown 丢失
 
@@ -68,6 +68,6 @@ macOS 26 上 NSMenu 的 keyEquivalent modifier 匹配并不严格相等。给 me
 
 ## 调试方式
 
-- 怀疑 menu 注入相关崩溃时：`defaults read com.apple.dt.Xcode` 找最近 crash log。
+- 怀疑 menu 注入相关崩溃时：读 `~/Library/Logs/DiagnosticReports/Kaku-*.ips` 里最近的 crash report。
 - 看 `NSMenu _performKeyEquivalentWithDelegate:` 栈帧是 AppKit 注入项的标志。
 - 主要复现环境是一台 macOS 26 实机。

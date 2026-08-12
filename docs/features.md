@@ -10,13 +10,19 @@ Run `kaku ai` to open the AI settings panel. Enable Kaku Assistant and edit the 
 
 | Field | Description |
 | :--- | :--- |
-| Auth Type | API key or Codex CLI login |
+| Auth Type | API key or Follow Codex |
 | Simple Model | Used for `#` command generation, command fixes, and lightweight chat |
 | Deep Model | Used for primary `Cmd + L` / `k` chat and tool use |
 | Base URL | OpenAI-compatible API root, such as `https://api.openai.com/v1` |
 | API Key | Provider API key when Auth Type is API key |
 
-For custom providers, keep Auth Type set to API key, enter the provider's OpenAI-compatible Base URL, and set the model names manually.
+For custom providers configured directly in Kaku, keep Auth Type set to API key,
+enter the provider's OpenAI-compatible Base URL, and set the model names manually.
+With Auth Type set to Codex, Kaku follows the user-level Codex connection under
+`CODEX_HOME` (falling back to `~/.codex`), including API-key or ChatGPT login,
+the selected model provider, Base URL, query parameters, and provider headers.
+Project configs, named profiles, and CLI overrides are intentionally excluded.
+Unsupported authentication modes fail before Kaku sends a request.
 
 ## AI Chat Panel
 
@@ -63,8 +69,8 @@ The config lives at `~/.config/kaku/assistant.toml`:
 | :--- | :--- |
 | `enabled` | `true` to enable, `false` to disable |
 | `api_key` | Your provider API key |
-| `model` | Simple Model for `#` command generation, command fixes, and lightweight chat |
-| `chat_model` | Deep Model for primary `Cmd + L` / `k` chat and tool use |
+| `model` | Simple Model for `#` command generation, command fixes, and lightweight chat; `Follow Codex` resolves the Codex model |
+| `chat_model` | Deep Model for primary `Cmd + L` / `k` chat and tool use; `Follow Codex` resolves the Codex model |
 | `chat_model_choices` | Optional curated list of chat models for the overlay picker |
 | `auto_fix_ignored_exit_codes` | Optional exit codes that should not trigger automatic command-fix suggestions, e.g. `[2]` |
 | `base_url` | OpenAI-compatible API root URL |
@@ -94,6 +100,15 @@ Kaku sends these requests to `{base_url}/responses`. Native web search runs at
 the model provider, so `web_search_provider` and `web_search_api_key` are not
 needed. Keep `chat_completions` for providers that only implement
 `/chat/completions`.
+
+When `auth_type = "codex"`, `base_url`, `api_key`, and `api_mode` do not define
+the connection. Kaku reads Codex's user configuration instead. New Codex-mode
+setups default both model fields to `Follow Codex`; either field can still be
+set to an explicit model as a Kaku-only override. The chat model switcher
+discovers available models from `{Codex provider base_url}/models` with that
+provider's resolved authentication, headers, and query parameters. Explicit
+Kaku model overrides are preserved when changing authentication modes. If the
+Codex config has no `model`, Kaku uses the first model returned by that endpoint.
 
 ---
 

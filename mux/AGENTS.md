@@ -16,13 +16,10 @@ The `mux` crate owns tab, pane, domain, and mux state management.
 - `mux/src/pane.rs`: pane state and interfaces
 - `mux/src/window.rs`: window-level mux state
 - `mux/src/domain.rs`: domain abstractions
-- `mux/src/client.rs` and `mux/src/server.rs`: protocol flow
+- `mux/src/client.rs` and `crates/wezterm-mux-server-impl/src/` (`sessionhandler.rs`, `dispatch.rs`, `local.rs`): protocol flow
 
 ## Practical Rules
 
-- Preserve domain abstraction boundaries.
-- Avoid leaking GUI assumptions into mux core.
-- Treat mux state transitions as high-risk changes.
 - Keep alert propagation reliable, including `Alert::SetUserVar`, because GUI reload and user-var hooks depend on this path.
 - Preserve pane and overlay invalidation signals consumed by GUI AI/chat overlays when panes split, move, close, or resize.
 

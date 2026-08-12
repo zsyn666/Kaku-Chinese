@@ -619,7 +619,7 @@ impl RenderState {
 
         // Keep the layers sorted by zindex so that they are rendered in
         // the correct order when the layers array is iterated.
-        layers.sort_by(|a, b| a.zindex.cmp(&b.zindex));
+        layers.sort_by_key(|layer| layer.zindex);
 
         Ok(layer)
     }

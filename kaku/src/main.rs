@@ -576,15 +576,20 @@ fn select_main_menu_command() -> anyhow::Result<Option<SubCommand>> {
     loop {
         match event::read().context("read main menu input")? {
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                // These stay unguarded arms: a `selected > 0` style match guard
+                // would let 'k'/'j' at the ends of the menu fall through to the
+                // letter-shortcut arm below and launch a menu item.
                 KeyCode::Up | KeyCode::Char('k') => {
-                    if selected > 0 {
-                        selected -= 1;
+                    let next = selected.saturating_sub(1);
+                    if next != selected {
+                        selected = next;
                         render_menu(selected, GREEN, PURPLE_BOLD, GRAY, RESET)?;
                     }
                 }
                 KeyCode::Down | KeyCode::Char('j') => {
-                    if selected + 1 < MENU_ITEMS.len() {
-                        selected += 1;
+                    let next = (selected + 1).min(MENU_ITEMS.len().saturating_sub(1));
+                    if next != selected {
+                        selected = next;
                         render_menu(selected, GREEN, PURPLE_BOLD, GRAY, RESET)?;
                     }
                 }

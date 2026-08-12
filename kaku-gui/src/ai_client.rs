@@ -8,20 +8,18 @@
 //! Runs on a plain OS thread (inside overlay), so blocking I/O is fine.
 
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{BufRead, BufReader, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
 
 use crate::ai_auth;
+use crate::codex_connection::{self, CodexConnection, CodexCredential};
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, CONTENT_TYPE};
 
 const DEFAULT_MODEL: &str = "gpt-5.4-mini";
 const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
-/// Codex (ChatGPT subscription) Responses backend. ChatGPT-login OAuth tokens
-/// are only accepted here, not on /chat/completions.
-const CODEX_RESPONSES_URL: &str = "https://chatgpt.com/backend-api/codex/responses";
 const MAX_RESPONSE_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MODELS_BODY_BYTES: usize = 1024 * 1024;
 const MAX_RESPONSE_SSE_LINE_BYTES: usize = 1024 * 1024;
@@ -84,7 +82,7 @@ pub struct AssistantConfig {
     /// Provider name derived from base_url and auth_type (e.g. "OpenAI", "Copilot").
     pub provider: String,
     /// API wire format for API-key/custom endpoints. Chat Completions remains
-    /// the compatibility default; Codex auth always uses its fixed Responses backend.
+    /// the compatibility default; Codex following mode resolves its own Responses provider.
     pub api_mode: ApiMode,
     /// Auth mechanism: "api_key" (default), "copilot", or "codex".
     /// Legacy "gemini_key" values are recognized only to surface a friendly
@@ -165,11 +163,11 @@ impl AssistantConfig {
             .filter(|s| !s.is_empty())
             .map(String::from);
 
-        let simple_model = legacy_fast_model.clone().unwrap_or_else(|| model.clone());
+        let mut simple_model = legacy_fast_model.clone().unwrap_or_else(|| model.clone());
 
         // If an old config had both model and fast_model but no chat_model,
         // preserve model as the deep slot and fold fast_model into Simple Model.
-        let chat_model = parsed
+        let mut chat_model = parsed
             .get("chat_model")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
@@ -180,6 +178,22 @@ impl AssistantConfig {
                     simple_model.clone()
                 }
             });
+
+        if auth_type == "codex"
+            && (simple_model == codex_connection::FOLLOW_CODEX_MODEL
+                || chat_model == codex_connection::FOLLOW_CODEX_MODEL)
+        {
+            if let Some(codex_model) = codex_connection::load_configured_codex_model()
+                .context("resolve configured Follow Codex model")?
+            {
+                if simple_model == codex_connection::FOLLOW_CODEX_MODEL {
+                    simple_model = codex_model.clone();
+                }
+                if chat_model == codex_connection::FOLLOW_CODEX_MODEL {
+                    chat_model = codex_model;
+                }
+            }
+        }
 
         let chat_model_choices = parsed
             .get("chat_model_choices")
@@ -455,7 +469,7 @@ impl ChatStepResult {
 pub struct AiClient {
     config: AssistantConfig,
     client: reqwest::blocking::Client,
-    codex_auth: Arc<Mutex<Option<ai_auth::CodexAuth>>>,
+    codex_discovered_model: Arc<OnceLock<String>>,
     max_request_attempts: u32,
 }
 
@@ -478,9 +492,20 @@ fn build_client_with_proxy_redirects(
     timeout: std::time::Duration,
     follow_redirects: bool,
 ) -> reqwest::blocking::Client {
+    build_client_with_proxy_options(timeout, None, follow_redirects)
+}
+
+fn build_client_with_proxy_options(
+    timeout: std::time::Duration,
+    read_timeout: Option<std::time::Duration>,
+    follow_redirects: bool,
+) -> reqwest::blocking::Client {
     let mut builder = reqwest::blocking::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(timeout);
+    if let Some(read_timeout) = read_timeout {
+        builder = builder.timeout(read_timeout);
+    }
     if !follow_redirects {
         builder = builder.redirect(reqwest::redirect::Policy::none());
     }
@@ -510,7 +535,10 @@ fn build_client_with_proxy_redirects(
 
     builder.build().unwrap_or_else(|e| {
         log::warn!("Failed to build HTTP client: {e}; falling back to default client");
-        let fallback = reqwest::blocking::Client::builder();
+        let mut fallback = reqwest::blocking::Client::builder();
+        if let Some(read_timeout) = read_timeout {
+            fallback = fallback.timeout(read_timeout);
+        }
         let fallback = if follow_redirects {
             fallback
         } else {
@@ -577,7 +605,7 @@ impl AiClient {
         Self {
             config,
             client: shared_http_client().clone(),
-            codex_auth: Arc::new(Mutex::new(None)),
+            codex_discovered_model: Arc::new(OnceLock::new()),
             max_request_attempts: 3,
         }
     }
@@ -590,35 +618,9 @@ impl AiClient {
         Self {
             config,
             client: build_client_with_proxy(timeout),
-            codex_auth: Arc::new(Mutex::new(None)),
+            codex_discovered_model: Arc::new(OnceLock::new()),
             max_request_attempts: 1,
         }
-    }
-
-    fn codex_auth(&self) -> Result<ai_auth::CodexAuth> {
-        if let Some(auth) = self
-            .codex_auth
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Codex auth cache poisoned"))?
-            .clone()
-        {
-            return Ok(auth);
-        }
-
-        let auth = ai_auth::read_codex_auth().ok_or_else(|| {
-            anyhow::anyhow!("Codex: not logged in. Run `codex` to authenticate, then retry.")
-        })?;
-        self.store_codex_auth(auth.clone())?;
-        Ok(auth)
-    }
-
-    fn store_codex_auth(&self, auth: ai_auth::CodexAuth) -> Result<()> {
-        let mut cache = self
-            .codex_auth
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Codex auth cache poisoned"))?;
-        *cache = Some(auth);
-        Ok(())
     }
 
     /// Whether this client will include tools in chat requests.
@@ -655,6 +657,11 @@ impl AiClient {
     /// Fetch available chat models from `{base_url}/models`.
     /// Filters out non-chat models (embeddings, TTS, image, etc.).
     pub fn list_models(&self) -> Result<Vec<String>> {
+        if self.config.auth_type == "codex" {
+            let connection = codex_connection::load_codex_connection()
+                .context("resolve user Codex connection for model discovery")?;
+            return self.list_codex_models(&connection);
+        }
         let url = format!("{}/models", self.config.base_url);
         let req = self.client.get(&url);
         let req = self.apply_auth_headers(req)?;
@@ -664,22 +671,162 @@ impl AiClient {
             let body = read_error_response_preview(resp, MAX_ERROR_BODY_BYTES);
             anyhow::bail!("models API {}: {}", status, body);
         }
-        let body = read_body_capped(resp, MAX_MODELS_BODY_BYTES, "models API")?;
-        let v: serde_json::Value =
-            serde_json::from_slice(&body).context("parse /models response")?;
-        let arr = v
-            .get("data")
-            .and_then(|d| d.as_array())
-            .ok_or_else(|| anyhow::anyhow!("missing `data` array in /models response"))?;
-        let mut out: Vec<String> = arr
-            .iter()
-            .filter_map(|m| m.get("id").and_then(|s| s.as_str()).map(String::from))
-            .filter(|id| kaku_ai_utils::is_chat_model_id(id))
-            .collect();
-        out.sort();
-        out.dedup();
-        out.truncate(30);
-        Ok(out)
+        parse_models_response(resp, "models API", true)
+    }
+
+    fn list_codex_models(&self, connection: &CodexConnection) -> Result<Vec<String>> {
+        let endpoint = connection.models_endpoint();
+        let mut credential = connection.credential.clone();
+        let mut provider_headers = HeaderMap::new();
+        for (name, value) in &connection.headers {
+            let name = HeaderName::from_bytes(name.as_bytes())
+                .with_context(|| format!("invalid Codex provider header name `{name}`"))?;
+            let value = HeaderValue::from_str(value)
+                .with_context(|| format!("invalid Codex provider header value for `{name}`"))?;
+            provider_headers.insert(name, value);
+        }
+
+        let build = |credential: &CodexCredential| {
+            let mut req = self
+                .client
+                .get(&endpoint)
+                .query(&connection.query_params)
+                .header("Accept", "application/json")
+                .header("User-Agent", "codex_cli_rs")
+                .headers(provider_headers.clone());
+            match credential {
+                CodexCredential::ChatGpt(auth) => {
+                    req = req
+                        .header("Authorization", format!("Bearer {}", auth.access_token))
+                        .header("OpenAI-Beta", "responses=experimental")
+                        .header("originator", "codex_cli_rs");
+                    if let Some(account_id) = auth.account_id.as_deref() {
+                        req = req.header("chatgpt-account-id", account_id);
+                    }
+                }
+                CodexCredential::Bearer(token) => {
+                    req = req.header("Authorization", format!("Bearer {token}"));
+                }
+                CodexCredential::None => {}
+            }
+            req
+        };
+
+        let cancelled = AtomicBool::new(false);
+        let response = self.send_codex_request_with_retry(
+            &mut credential,
+            &self.client,
+            build,
+            "Codex model discovery",
+            &cancelled,
+            connection.request_max_attempts,
+        )?;
+        let models = parse_models_response(response, "Codex model discovery", false)?;
+        if models.is_empty() {
+            anyhow::bail!("Codex model discovery returned no chat models");
+        }
+        Ok(models)
+    }
+
+    fn resolve_codex_request_model(
+        &self,
+        connection: &CodexConnection,
+        requested_model: &str,
+    ) -> Result<String> {
+        if requested_model != codex_connection::FOLLOW_CODEX_MODEL {
+            return Ok(requested_model.to_string());
+        }
+        if let Some(configured) = connection
+            .model
+            .as_deref()
+            .filter(|model| !model.trim().is_empty())
+        {
+            return Ok(configured.to_string());
+        }
+        if let Some(cached) = self.codex_discovered_model.get() {
+            return Ok(cached.clone());
+        }
+        let discovered = self
+            .list_codex_models(connection)?
+            .into_iter()
+            .next()
+            .ok_or_else(|| anyhow::anyhow!("Codex provider returned no models"))?;
+        let _ = self.codex_discovered_model.set(discovered.clone());
+        Ok(discovered)
+    }
+
+    fn send_codex_request_with_retry<F>(
+        &self,
+        credential: &mut CodexCredential,
+        http_client: &reqwest::blocking::Client,
+        build: F,
+        provider_label: &str,
+        cancelled: &AtomicBool,
+        max_attempts: u32,
+    ) -> Result<reqwest::blocking::Response>
+    where
+        F: Fn(&CodexCredential) -> reqwest::blocking::RequestBuilder,
+    {
+        let max_attempts = max_attempts.max(1);
+        let mut last_err = String::new();
+        let mut refreshed_chatgpt = false;
+        let mut attempt = 0;
+        while attempt < max_attempts {
+            if attempt > 0 {
+                std::thread::sleep(std::time::Duration::from_secs(1 << attempt));
+                if cancelled.load(Ordering::Relaxed) {
+                    anyhow::bail!("cancelled during retry backoff");
+                }
+            }
+            let response = match build(credential).send() {
+                Ok(response) => response,
+                Err(error) => {
+                    last_err = error.without_url().to_string();
+                    log::warn!(
+                        "{} HTTP attempt {}: {}",
+                        provider_label,
+                        attempt + 1,
+                        last_err
+                    );
+                    attempt += 1;
+                    continue;
+                }
+            };
+            let status = response.status();
+            if status == reqwest::StatusCode::UNAUTHORIZED
+                && matches!(credential, CodexCredential::ChatGpt(_))
+                && !refreshed_chatgpt
+            {
+                log::debug!("{provider_label} ChatGPT token rejected; refreshing");
+                *credential = CodexCredential::ChatGpt(ai_auth::refresh_codex_auth(http_client)?);
+                refreshed_chatgpt = true;
+                continue;
+            }
+            if status.is_success() {
+                return Ok(response);
+            }
+            let code = status.as_u16();
+            let body = read_error_response_preview(response, MAX_ERROR_BODY_BYTES);
+            if code == 429 || code >= 500 {
+                let preview: String = body.chars().take(200).collect();
+                last_err = format!("{provider_label} error {code}: {preview}");
+                log::warn!(
+                    "{} HTTP attempt {} retryable: {}",
+                    provider_label,
+                    attempt + 1,
+                    last_err
+                );
+                attempt += 1;
+                continue;
+            }
+            anyhow::bail!("{provider_label} error {code}: {body}");
+        }
+        Err(anyhow::anyhow!(
+            "{} request failed after {} attempts: {}",
+            provider_label,
+            max_attempts,
+            last_err
+        ))
     }
 
     /// Build provider-specific auth headers for the HTTP request builder.
@@ -698,10 +845,9 @@ impl AiClient {
                     .header("Openai-Intent", "conversation-panel")
             }
             "codex" => {
-                let token = ai_auth::read_codex_access_token().ok_or_else(|| {
-                    anyhow::anyhow!("Codex: not logged in. Run `codex auth login` to authenticate.")
-                })?;
-                req.header("Authorization", format!("Bearer {token}"))
+                anyhow::bail!(
+                    "Codex following mode must use the resolved Codex Responses connection"
+                )
             }
             _ => {
                 if self.config.api_key.trim().is_empty() {
@@ -747,8 +893,8 @@ impl AiClient {
         on_token: &mut dyn FnMut(&str),
         on_reasoning: &mut dyn FnMut(&str),
     ) -> Result<ChatStepResult> {
-        // Codex (ChatGPT subscription) uses the Responses backend, not
-        // /chat/completions, so it needs an entirely separate transport.
+        // Codex following mode resolves the user's Codex Responses provider
+        // rather than using assistant.toml's Chat Completions connection.
         if self.config.auth_type == "codex" {
             return self.chat_step_codex(model, messages, tools, cancelled, on_token, on_reasoning);
         }
@@ -955,7 +1101,7 @@ impl AiClient {
         parse_responses_http(response, cancelled, on_token, on_reasoning, "Responses API")
     }
 
-    /// Codex (ChatGPT subscription) chat step over the Responses backend.
+    /// Codex-following chat step over the user-selected Responses provider.
     ///
     /// Translates chat-format messages and tools into the Responses request
     /// shape, streams text/reasoning, and assembles streamed `function_call`
@@ -969,23 +1115,64 @@ impl AiClient {
         on_token: &mut dyn FnMut(&str),
         on_reasoning: &mut dyn FnMut(&str),
     ) -> Result<ChatStepResult> {
+        let connection =
+            codex_connection::load_codex_connection().context("resolve user Codex connection")?;
+        let resolved_model = self.resolve_codex_request_model(&connection, model)?;
+        self.chat_step_codex_connection(
+            &connection,
+            &resolved_model,
+            messages,
+            tools,
+            cancelled,
+            on_token,
+            on_reasoning,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn chat_step_codex_connection(
+        &self,
+        connection: &CodexConnection,
+        model: &str,
+        messages: &[ApiMessage],
+        tools: &[serde_json::Value],
+        cancelled: &AtomicBool,
+        on_token: &mut dyn FnMut(&str),
+        on_reasoning: &mut dyn FnMut(&str),
+    ) -> Result<ChatStepResult> {
         use serde_json::{json, Value};
 
-        let mut auth = self.codex_auth()?;
+        let mut credential = connection.credential.clone();
 
         let (instructions, input) = translate_responses_messages(messages);
         let responses_tools =
             translate_responses_tools(tools, self.config.chat_tools_enabled, false);
 
+        let mut reasoning = serde_json::Map::new();
+        reasoning.insert(
+            "effort".to_string(),
+            Value::String(
+                connection
+                    .reasoning_effort
+                    .clone()
+                    .unwrap_or_else(|| "medium".to_string()),
+            ),
+        );
+        reasoning.insert(
+            "summary".to_string(),
+            Value::String(
+                connection
+                    .reasoning_summary
+                    .clone()
+                    .unwrap_or_else(|| "auto".to_string()),
+            ),
+        );
         let mut body = json!({
             "model": model,
             "input": input,
             "stream": true,
             "store": false,
-            // gpt-5-codex is a reasoning model; without an explicit effort it runs
-            // shallow and gives weak answers. `summary: auto` surfaces the thinking
-            // stream we already parse (response.reasoning_summary_text.delta).
-            "reasoning": { "effort": "medium", "summary": "auto" },
+            "reasoning": Value::Object(reasoning),
         });
         if !instructions.is_empty() {
             body["instructions"] = Value::String(instructions);
@@ -1000,44 +1187,89 @@ impl AiClient {
         // reasoning item without its encrypted content is rejected.
         body["include"] = json!(["reasoning.encrypted_content"]);
 
-        let build = |auth: &ai_auth::CodexAuth| -> reqwest::blocking::RequestBuilder {
-            let mut req = self
-                .client
-                .post(CODEX_RESPONSES_URL)
+        let endpoint = connection.endpoint();
+        let provider_client = connection.stream_idle_timeout_ms.map(|timeout_ms| {
+            build_client_with_proxy_options(
+                std::time::Duration::from_secs(600),
+                Some(std::time::Duration::from_millis(timeout_ms.max(1))),
+                true,
+            )
+        });
+        let http_client = provider_client.as_ref().unwrap_or(&self.client);
+        let mut provider_headers = HeaderMap::new();
+        for (name, value) in &connection.headers {
+            let name = HeaderName::from_bytes(name.as_bytes())
+                .with_context(|| format!("invalid Codex provider header name `{name}`"))?;
+            let value = HeaderValue::from_str(value)
+                .with_context(|| format!("invalid Codex provider header value for `{name}`"))?;
+            provider_headers.insert(name, value);
+        }
+        let build = |credential: &CodexCredential| -> reqwest::blocking::RequestBuilder {
+            let mut req = http_client
+                .post(&endpoint)
+                .query(&connection.query_params)
                 .header("Content-Type", "application/json")
-                .header("Accept", "text/event-stream")
-                .header("Authorization", format!("Bearer {}", auth.access_token))
-                .header("OpenAI-Beta", "responses=experimental")
-                .header("originator", "codex_cli_rs")
+                .header("Accept", "text/event-stream, application/json")
+                .header("Cache-Control", "no-cache")
+                .header("Accept-Encoding", "identity")
                 .header("User-Agent", "codex_cli_rs")
+                .headers(provider_headers.clone())
                 .json(&body);
-            if let Some(account_id) = auth.account_id.as_deref() {
-                req = req.header("chatgpt-account-id", account_id);
+            match credential {
+                CodexCredential::ChatGpt(auth) => {
+                    req = req
+                        .header("Authorization", format!("Bearer {}", auth.access_token))
+                        .header("OpenAI-Beta", "responses=experimental")
+                        .header("originator", "codex_cli_rs");
+                    if let Some(account_id) = auth.account_id.as_deref() {
+                        req = req.header("chatgpt-account-id", account_id);
+                    }
+                }
+                CodexCredential::Bearer(token) => {
+                    req = req.header("Authorization", format!("Bearer {token}"));
+                }
+                CodexCredential::None => {}
             }
             req
         };
 
-        // Use the cached token; on 401 (expired) refresh once, persist it, then retry.
-        let mut response = build(&auth).send().context("Codex responses request")?;
-        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
-            log::debug!("Codex access token rejected (401); refreshing");
-            auth = ai_auth::refresh_codex_auth(&self.client)?;
-            self.store_codex_auth(auth.clone())?;
-            response = build(&auth).send().context("Codex responses retry")?;
-        }
-        if !response.status().is_success() {
-            let status = response.status();
-            let preview = read_error_response_preview(response, 400);
-            anyhow::bail!("Codex responses error {status}: {preview}");
-        }
+        for stream_attempt in 0..=connection.stream_max_retries {
+            let response = self.send_codex_request_with_retry(
+                &mut credential,
+                http_client,
+                build,
+                "Codex provider",
+                cancelled,
+                connection.request_max_attempts,
+            )?;
 
-        parse_responses_http(
-            response,
-            cancelled,
-            on_token,
-            on_reasoning,
-            "Codex responses",
-        )
+            let emitted = std::cell::Cell::new(false);
+            let parsed = parse_responses_http(
+                response,
+                cancelled,
+                &mut |token| {
+                    emitted.set(true);
+                    on_token(token);
+                },
+                &mut |reasoning| {
+                    emitted.set(true);
+                    on_reasoning(reasoning);
+                },
+                "Codex provider",
+            );
+            match parsed {
+                Ok(result) => return Ok(result),
+                Err(err) if !emitted.get() && stream_attempt < connection.stream_max_retries => {
+                    log::warn!(
+                        "Codex provider stream attempt {} failed before output: {}; retrying",
+                        stream_attempt + 1,
+                        err
+                    );
+                }
+                Err(err) => return Err(err),
+            }
+        }
+        unreachable!("Codex stream loop always returns")
     }
 }
 
@@ -1999,7 +2231,9 @@ fn send_with_retry(
         let r = match req.try_clone().context("clone request")?.send() {
             Ok(r) => r,
             Err(e) => {
-                last_err = e.to_string();
+                // Provider URLs can contain secret query parameters. Keep the
+                // transport error while removing the URL before logs/UI see it.
+                last_err = e.without_url().to_string();
                 log::warn!(
                     "{} HTTP attempt {}: {}",
                     provider_label,
@@ -2037,6 +2271,59 @@ fn send_with_retry(
 }
 
 // ─── Private helpers ──────────────────────────────────────────────────────────
+
+fn parse_models_response(
+    response: reqwest::blocking::Response,
+    provider_label: &str,
+    sort_models: bool,
+) -> Result<Vec<String>> {
+    let body = read_body_capped(response, MAX_MODELS_BODY_BYTES, provider_label)?;
+    let value: serde_json::Value = serde_json::from_slice(&body)
+        .with_context(|| format!("parse {provider_label} response"))?;
+    parse_models_value(&value, provider_label, sort_models)
+}
+
+fn parse_models_value(
+    value: &serde_json::Value,
+    provider_label: &str,
+    sort_models: bool,
+) -> Result<Vec<String>> {
+    let entries = value
+        .get("data")
+        .or_else(|| value.get("models"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            anyhow::anyhow!("{provider_label} response has no `data` or `models` array")
+        })?;
+    let mut models: Vec<String> = entries
+        .iter()
+        .filter(|entry| {
+            entry
+                .get("visibility")
+                .and_then(serde_json::Value::as_str)
+                .is_none_or(|visibility| visibility == "list")
+        })
+        .filter_map(|entry| {
+            entry
+                .as_str()
+                .or_else(|| entry.get("id").and_then(serde_json::Value::as_str))
+                .or_else(|| entry.get("slug").and_then(serde_json::Value::as_str))
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(String::from)
+        })
+        .filter(|model| kaku_ai_utils::is_chat_model_id(model))
+        .collect();
+    if sort_models {
+        models.sort();
+        models.dedup();
+    } else {
+        let mut seen = HashSet::new();
+        models.retain(|model| seen.insert(model.clone()));
+    }
+    models.truncate(30);
+    Ok(models)
+}
 
 /// Buffer for accumulating streamed tool call fragments.
 #[derive(Default)]
@@ -2310,14 +2597,15 @@ fn detect_provider_with_auth(base_url: &str, auth_type: &str) -> &'static str {
 mod tests {
     use super::{
         add_stream_bytes, add_stream_event, build_no_proxy_list, content_type_is_json,
-        detect_provider_with_auth, parse_custom_headers, parse_responses_sse,
+        detect_provider_with_auth, parse_custom_headers, parse_models_value, parse_responses_sse,
         parse_responses_value, read_body_capped, read_sse_line_capped, reasoning_delta_text,
         should_roundtrip_reasoning_content, sse_data_payload, supports_encrypted_reasoning_include,
         translate_responses_messages, translate_responses_tools, AiClient, ApiMessage, ApiMode,
-        AssistantConfig, InlineThinkFilter, ThinkSegment, MAX_MODELS_BODY_BYTES,
+        AssistantConfig, InlineThinkFilter, ThinkSegment, DEFAULT_BASE_URL, MAX_MODELS_BODY_BYTES,
         MAX_RESPONSE_SSE_LINE_BYTES, MAX_RESPONSE_STREAM_BYTES, MAX_RESPONSE_STREAM_EVENTS,
         MAX_RESPONSE_TOOL_ARGUMENT_BYTES,
     };
+    use crate::codex_connection::{CodexConnection, CodexCredential};
     use reqwest::header::{AUTHORIZATION, USER_AGENT};
     use std::io::{Cursor, Read, Write};
     use std::net::TcpListener;
@@ -2334,6 +2622,13 @@ mod tests {
             }
         }
         (tokens, reasoning)
+    }
+
+    #[test]
+    fn generic_models_parser_preserves_empty_success_response() {
+        let models = parse_models_value(&serde_json::json!({ "data": [] }), "models API", true)
+            .expect("empty model list remains a successful response");
+        assert!(models.is_empty());
     }
 
     fn route_mock_sse_lines(lines: &[&str]) -> (String, String) {
@@ -2776,6 +3071,369 @@ mod tests {
             body.get("include").is_none(),
             "custom Responses endpoints must not receive OpenAI-only include values"
         );
+    }
+
+    #[test]
+    fn codex_connection_posts_to_custom_provider_with_headers_and_query() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Codex provider");
+        let address = listener.local_addr().expect("mock provider address");
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept Codex request");
+            let mut request = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0_u8; 4096];
+                let count = stream.read(&mut chunk).expect("read Codex headers");
+                assert!(count > 0, "connection closed before Codex headers");
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .expect("Codex content-length header");
+            while request.len() < header_end + content_length {
+                let mut chunk = [0_u8; 4096];
+                let count = stream.read(&mut chunk).expect("read Codex body");
+                assert!(count > 0, "connection closed before Codex body");
+                request.extend_from_slice(&chunk[..count]);
+            }
+            request_tx.send(request).expect("capture Codex request");
+
+            let body = concat!(
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"followed\"}\n\n",
+                "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"completed\",\"output\":[]}}\n\n"
+            );
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write Codex response");
+        });
+
+        let config = AssistantConfig {
+            api_key: String::new(),
+            chat_model: "gpt-followed".to_string(),
+            chat_model_choices: Vec::new(),
+            base_url: DEFAULT_BASE_URL.to_string(),
+            custom_headers: Vec::new(),
+            provider: "Codex".to_string(),
+            api_mode: ApiMode::Responses,
+            auth_type: "codex".to_string(),
+            chat_tools_enabled: true,
+            native_web_search: false,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_fetch_script: None,
+            fast_model: None,
+            memory_curator_model: None,
+        };
+        let client = AiClient::new_with_timeout(config, std::time::Duration::from_secs(5));
+        let connection = CodexConnection {
+            model: Some("gpt-followed".to_string()),
+            reasoning_effort: Some("high".to_string()),
+            reasoning_summary: Some("auto".to_string()),
+            base_url: format!("http://{address}/v1"),
+            headers: vec![("x-codex-provider".to_string(), "followed".to_string())],
+            query_params: vec![("tenant".to_string(), "kaku".to_string())],
+            credential: CodexCredential::None,
+            request_max_attempts: 1,
+            stream_max_retries: 0,
+            stream_idle_timeout_ms: None,
+        };
+        let mut text = String::new();
+        client
+            .chat_step_codex_connection(
+                &connection,
+                "gpt-followed",
+                &[ApiMessage::user("hello")],
+                &[],
+                &AtomicBool::new(false),
+                &mut |token| text.push_str(token),
+                &mut |_| {},
+            )
+            .expect("Codex provider request");
+        assert_eq!(text, "followed");
+
+        server.join().expect("mock Codex provider");
+        let request = request_rx.recv().expect("captured Codex request");
+        let header_end = request
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .expect("Codex request separator")
+            + 4;
+        let headers = String::from_utf8_lossy(&request[..header_end]).to_ascii_lowercase();
+        assert!(headers.starts_with("post /v1/responses?tenant=kaku http/1.1"));
+        assert!(headers.contains("x-codex-provider: followed"));
+        assert!(!headers.contains("authorization:"));
+        let body: serde_json::Value =
+            serde_json::from_slice(&request[header_end..]).expect("Codex request JSON");
+        assert_eq!(body["model"], "gpt-followed");
+        assert_eq!(body["reasoning"]["effort"], "high");
+    }
+
+    #[test]
+    fn codex_model_discovery_uses_provider_models_endpoint_and_connection_metadata() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock Codex provider");
+        let address = listener.local_addr().expect("mock provider address");
+        let (request_tx, request_rx) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept models request");
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 4096];
+                let count = stream.read(&mut chunk).expect("read models request");
+                assert!(count > 0, "connection closed before models headers");
+                request.extend_from_slice(&chunk[..count]);
+                if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            request_tx.send(request).expect("capture models request");
+
+            let body = r#"{"data":[{"id":"custom-chat"},{"id":"text-embedding-3-small"},{"id":"custom-fast"}]}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            )
+            .expect("write models response");
+        });
+
+        let config = AssistantConfig {
+            api_key: String::new(),
+            chat_model: "custom-chat".to_string(),
+            chat_model_choices: Vec::new(),
+            base_url: DEFAULT_BASE_URL.to_string(),
+            custom_headers: Vec::new(),
+            provider: "Codex".to_string(),
+            api_mode: ApiMode::Responses,
+            auth_type: "codex".to_string(),
+            chat_tools_enabled: true,
+            native_web_search: false,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_fetch_script: None,
+            fast_model: None,
+            memory_curator_model: None,
+        };
+        let client = AiClient::new_with_timeout(config, std::time::Duration::from_secs(5));
+        let connection = CodexConnection {
+            model: None,
+            reasoning_effort: None,
+            reasoning_summary: None,
+            base_url: format!("http://{address}/v1"),
+            headers: vec![("x-codex-provider".to_string(), "followed".to_string())],
+            query_params: vec![("tenant".to_string(), "kaku".to_string())],
+            credential: CodexCredential::Bearer("models-key".to_string()),
+            request_max_attempts: 1,
+            stream_max_retries: 0,
+            stream_idle_timeout_ms: None,
+        };
+
+        let model = client
+            .resolve_codex_request_model(&connection, crate::codex_connection::FOLLOW_CODEX_MODEL)
+            .expect("discover Codex provider model");
+        assert_eq!(model, "custom-chat");
+
+        server.join().expect("mock models provider");
+        let request = request_rx.recv().expect("captured models request");
+        let headers = String::from_utf8_lossy(&request).to_ascii_lowercase();
+        assert!(headers.starts_with("get /v1/models?tenant=kaku http/1.1"));
+        assert!(headers.contains("x-codex-provider: followed"));
+        assert!(headers.contains("authorization: bearer models-key"));
+    }
+
+    #[test]
+    fn codex_chatgpt_requests_honor_provider_retry_count() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind retry provider");
+        let address = listener.local_addr().expect("retry provider address");
+        let server = std::thread::spawn(move || {
+            for attempt in 0..2 {
+                let (mut stream, _) = listener.accept().expect("accept retry request");
+                let mut request = Vec::new();
+                loop {
+                    let mut chunk = [0_u8; 4096];
+                    let count = stream.read(&mut chunk).expect("read retry request");
+                    assert!(count > 0, "connection closed before retry headers");
+                    request.extend_from_slice(&chunk[..count]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let headers = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                assert!(headers.contains("authorization: bearer oauth-test"));
+                let status = if attempt == 0 {
+                    "500 Internal Server Error"
+                } else {
+                    "200 OK"
+                };
+                write!(
+                    stream,
+                    "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}"
+                )
+                .expect("write retry response");
+            }
+        });
+
+        let config = AssistantConfig {
+            api_key: String::new(),
+            chat_model: "custom-chat".to_string(),
+            chat_model_choices: Vec::new(),
+            base_url: DEFAULT_BASE_URL.to_string(),
+            custom_headers: Vec::new(),
+            provider: "Codex".to_string(),
+            api_mode: ApiMode::Responses,
+            auth_type: "codex".to_string(),
+            chat_tools_enabled: true,
+            native_web_search: false,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_fetch_script: None,
+            fast_model: None,
+            memory_curator_model: None,
+        };
+        let client = AiClient::new_with_timeout(config, std::time::Duration::from_secs(5));
+        let endpoint = format!("http://{address}/models");
+        let build = |credential: &CodexCredential| {
+            let CodexCredential::ChatGpt(auth) = credential else {
+                panic!("expected ChatGPT credential");
+            };
+            client
+                .client
+                .get(&endpoint)
+                .header("Authorization", format!("Bearer {}", auth.access_token))
+        };
+        let mut credential = CodexCredential::ChatGpt(crate::ai_auth::CodexAuth {
+            access_token: "oauth-test".to_string(),
+            account_id: None,
+        });
+        let response = client
+            .send_codex_request_with_retry(
+                &mut credential,
+                &client.client,
+                build,
+                "retry provider",
+                &AtomicBool::new(false),
+                2,
+            )
+            .expect("ChatGPT request retries");
+        assert!(response.status().is_success());
+        server.join().expect("retry provider server");
+    }
+
+    #[test]
+    fn codex_stream_idle_timeout_resets_when_data_keeps_arriving() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind streaming provider");
+        let address = listener.local_addr().expect("streaming provider address");
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept streaming request");
+            let mut request = Vec::new();
+            let header_end = loop {
+                let mut chunk = [0_u8; 4096];
+                let count = stream.read(&mut chunk).expect("read streaming headers");
+                assert!(count > 0, "connection closed before streaming headers");
+                request.extend_from_slice(&chunk[..count]);
+                if let Some(pos) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                    break pos + 4;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .expect("streaming content-length header");
+            while request.len() < header_end + content_length {
+                let mut chunk = [0_u8; 4096];
+                let count = stream.read(&mut chunk).expect("read streaming body");
+                assert!(count > 0, "connection closed before streaming body");
+                request.extend_from_slice(&chunk[..count]);
+            }
+
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n"
+            )
+            .expect("write streaming headers");
+            write!(
+                stream,
+                "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"still \"}}\n\n"
+            )
+            .expect("write first stream event");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            write!(
+                stream,
+                "data: {{\"type\":\"response.output_text.delta\",\"delta\":\"alive\"}}\n\n"
+            )
+            .expect("write second stream event");
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            write!(
+                stream,
+                "data: {{\"type\":\"response.completed\",\"response\":{{\"status\":\"completed\",\"output\":[]}}}}\n\n"
+            )
+            .expect("write completed event");
+        });
+
+        let config = AssistantConfig {
+            api_key: String::new(),
+            chat_model: "custom-chat".to_string(),
+            chat_model_choices: Vec::new(),
+            base_url: DEFAULT_BASE_URL.to_string(),
+            custom_headers: Vec::new(),
+            provider: "Codex".to_string(),
+            api_mode: ApiMode::Responses,
+            auth_type: "codex".to_string(),
+            chat_tools_enabled: true,
+            native_web_search: false,
+            web_search_provider: None,
+            web_search_api_key: None,
+            web_fetch_script: None,
+            fast_model: None,
+            memory_curator_model: None,
+        };
+        let client = AiClient::new_with_timeout(config, std::time::Duration::from_secs(5));
+        let connection = CodexConnection {
+            model: Some("custom-chat".to_string()),
+            reasoning_effort: None,
+            reasoning_summary: None,
+            base_url: format!("http://{address}"),
+            headers: Vec::new(),
+            query_params: Vec::new(),
+            credential: CodexCredential::None,
+            request_max_attempts: 1,
+            stream_max_retries: 0,
+            stream_idle_timeout_ms: Some(500),
+        };
+        let mut text = String::new();
+        client
+            .chat_step_codex_connection(
+                &connection,
+                "custom-chat",
+                &[ApiMessage::user("hello")],
+                &[],
+                &AtomicBool::new(false),
+                &mut |token| text.push_str(token),
+                &mut |_| {},
+            )
+            .expect("active stream outlives one idle-timeout window");
+        assert_eq!(text, "still alive");
+        server.join().expect("streaming provider server");
     }
 
     #[test]
