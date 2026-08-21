@@ -19,6 +19,8 @@ Kaku is a macOS-native terminal emulator derived from WezTerm and shaped around 
 - `.agents/skills/` - the canonical home for project skills, and the only tracked copy: `.claude/` is gitignored here, so `.claude/skills/<name>` are relative symlinks pointing back into `.agents/`. Add a skill under `.agents/skills/` and symlink it, never the reverse, or it ships to nobody. Skills: `release`, `maintainer-sweep`, `product-docs`, `bugs` (proactive multi-entry UX / latent-defect sweep). Exception: `.claude/rules/macos.md` is force-added and tracked despite the ignore rule; anything else added under `.claude/` needs `git add -f` or it stays local-only.
 - `.github/workflows/checks.yml` - fast correctness gates on pushes to `main` and on pull requests, with `paths-ignore` for `**.md` and assets, so a docs-only change gets no CI at all. Runs fmt, check, tests, and the log/prompt guards; clippy is scoped to the lint-opt-in crates, not the workspace.
 - `.github/workflows/build-validation.yml` - release-shaped universal/bundle builds; runs on build-pipeline changes, daily, or on dispatch. `release.sh` preflight requires its latest run green.
+- `.github/workflows/release.yml` - automated release pipeline on tag push (`v*`) or dispatch; builds universal macOS DMG, in-app update zip, checksums, and publishes GitHub Release.
+- `.github/workflows/nightly.yml` - daily rolling nightly preview release pipeline.
 - `.github/RELEASE_NOTES.md` - source for the GitHub Release title and body.
 
 ## Commands

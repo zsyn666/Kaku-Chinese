@@ -1,0 +1,193 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+      - 'V*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name for the release (e.g. v0.18.1; empty uses current ref/tag)'
+        required: false
+        default: ''
+      draft:
+        description: 'Create release as a draft'
+        required: false
+        type: boolean
+        default: false
+      prerelease:
+        description: 'Mark release as pre-release'
+        required: false
+        type: boolean
+        default: false
+      skip_tests:
+        description: 'Skip running tests before building'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Pre-release Tests
+    runs-on: macos-latest
+    if: ${{ !inputs.skip_tests }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.95.0
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@f092c064826410a38929a5791d2c0225b94432fe # nextest
+
+      - name: Run unit tests
+        run: |
+          cargo nextest run --locked -E 'not test(shapecache::test::ligatures_jetbrains)'
+          cargo nextest run --locked -p wezterm-escape-parser
+
+      - name: Guard checks
+        run: |
+          ./scripts/check_toolchain_pins.sh
+          ./scripts/check_logs.sh
+          ./scripts/check_prompts.sh
+
+  build-release:
+    name: Build & Publish Release
+    runs-on: macos-latest
+    needs: [test]
+    if: ${{ always() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.95.0
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Determine Release Tag
+        id: vars
+        run: |
+          if [ -n "${{ inputs.tag_name }}" ]; then
+            TAG="${{ inputs.tag_name }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            CARGO_VERSION=$(grep '^version =' kaku/Cargo.toml | head -n1 | cut -d'"' -f2)
+            TAG="v${CARGO_VERSION}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+
+      - name: Optional macOS Code Signing Setup
+        if: ${{ env.MACOS_CERTIFICATE != '' }}
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+          MACOS_CERTIFICATE_PWD: ${{ secrets.MACOS_CERTIFICATE_PWD }}
+          MACOS_KEYCHAIN_PWD: ${{ secrets.MACOS_KEYCHAIN_PWD }}
+        run: |
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+          security create-keychain -p "$MACOS_KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$MACOS_KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+
+          CERT_PATH=$RUNNER_TEMP/certificate.p12
+          echo "$MACOS_CERTIFICATE" | base64 --decode > "$CERT_PATH"
+          security import "$CERT_PATH" -k "$KEYCHAIN_PATH" -P "$MACOS_CERTIFICATE_PWD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$MACOS_KEYCHAIN_PWD" "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+      - name: Build Universal macOS Bundle & DMG
+        env:
+          PROFILE: release-opt
+          BUILD_ARCH: universal
+          OUT_DIR: dist
+        run: |
+          set -o pipefail
+          ./scripts/build.sh 2>&1 | sed '/has no symbols/d'
+
+      - name: Generate Checksums
+        run: |
+          cd dist
+          shasum -a 256 Kaku.dmg > Kaku.dmg.sha256
+          shasum -a 256 kaku_for_update.zip > kaku_for_update.zip.sha256
+          shasum -a 256 Kaku.dmg kaku_for_update.zip > sha256sums.txt
+          echo "Checksums generated:"
+          cat sha256sums.txt
+
+      - name: Prepare Release Notes
+        id: notes
+        run: |
+          NOTES_FILE="$RUNNER_TEMP/release_notes.md"
+          TAG="${{ steps.vars.outputs.tag }}"
+          CLEAN_VER="${TAG#[vV]}"
+
+          # Check if .github/RELEASE_NOTES.md matches current release
+          if [ -f .github/RELEASE_NOTES.md ] && grep -qiE "^# [vV]?${CLEAN_VER}" .github/RELEASE_NOTES.md; then
+            echo "Using .github/RELEASE_NOTES.md"
+            cp .github/RELEASE_NOTES.md "$NOTES_FILE"
+          else
+            echo "Generating release notes from commits"
+            cat > "$NOTES_FILE" << 'EOF'
+          <div align="center">
+            <img src="https://raw.githubusercontent.com/tw93/Kaku/main/assets/logo.png" alt="Kaku Logo" width="120" height="120" />
+            <h1 style="margin: 12px 0 6px;">Kaku ${{ steps.vars.outputs.tag }}</h1>
+            <p><em>A fast, out-of-the-box terminal built for AI coding.</em></p>
+          </div>
+
+          ### Downloads
+
+          | File | Description | Checksum |
+          |---|---|---|
+          | `Kaku.dmg` | macOS Universal App Disk Image (Apple Silicon & Intel) | `Kaku.dmg.sha256` |
+          | `kaku_for_update.zip` | In-app Auto Update Archive | `kaku_for_update.zip.sha256` |
+
+          ### Changelog
+          EOF
+            # Find previous tag
+            PREV_TAG=$(git describe --tags --abbrev=0 "${TAG}^" 2>/dev/null || true)
+            if [ -n "$PREV_TAG" ]; then
+              git log --no-merges --pretty=format:"* %s (%h)" "$PREV_TAG..HEAD" >> "$NOTES_FILE"
+            else
+              git log --no-merges --pretty=format:"* %s (%h)" -n 20 >> "$NOTES_FILE"
+            fi
+            echo -e "\n\n> https://github.com/${{ github.repository }}" >> "$NOTES_FILE"
+          fi
+          echo "notes_path=$NOTES_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Create or Update GitHub Release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87238604da99376a6cb63 # v2.2.1
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: Kaku ${{ steps.vars.outputs.tag }}
+          body_path: ${{ steps.notes.outputs.notes_path }}
+          draft: ${{ inputs.draft || false }}
+          prerelease: ${{ inputs.prerelease || false }}
+          files: |
+            dist/Kaku.dmg
+            dist/kaku_for_update.zip
+            dist/Kaku.dmg.sha256
+            dist/kaku_for_update.zip.sha256
+            dist/sha256sums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

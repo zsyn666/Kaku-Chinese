@@ -1,0 +1,107 @@
+name: Nightly Build
+
+on:
+  schedule:
+    # Daily backstop at 19:00 UTC (03:00 Beijing)
+    - cron: '0 19 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nightly-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-nightly:
+    name: Build & Publish Nightly Preview
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.95.0
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Build Universal macOS Bundle & DMG
+        env:
+          PROFILE: release-opt
+          BUILD_ARCH: universal
+          OUT_DIR: dist
+        run: |
+          set -o pipefail
+          ./scripts/build.sh 2>&1 | sed '/has no symbols/d'
+
+      - name: Prepare Nightly Assets & Checksums
+        run: |
+          cd dist
+          cp -f Kaku.dmg Kaku-nightly.dmg
+          shasum -a 256 Kaku-nightly.dmg > Kaku-nightly.dmg.sha256
+          shasum -a 256 kaku_for_update.zip > kaku_for_update.zip.sha256
+          shasum -a 256 Kaku-nightly.dmg kaku_for_update.zip > sha256sums.txt
+          echo "Nightly Checksums:"
+          cat sha256sums.txt
+
+      - name: Prepare Nightly Release Notes
+        id: notes
+        run: |
+          NOTES_FILE="$RUNNER_TEMP/nightly_notes.md"
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          BUILD_DATE=$(date -u "+%Y-%m-%d")
+          CARGO_VERSION=$(grep '^version =' kaku/Cargo.toml | head -n1 | cut -d'"' -f2)
+
+          cat > "$NOTES_FILE" << EOF
+          <div align="center">
+            <img src="https://raw.githubusercontent.com/tw93/Kaku/main/assets/logo.png" alt="Kaku Logo" width="120" height="120" />
+            <h1 style="margin: 12px 0 6px;">Kaku Nightly Preview</h1>
+            <p><em>A fast, out-of-the-box terminal built for AI coding.</em></p>
+          </div>
+
+          > ⚠️ **Nightly Preview Build** from \`main\` at \`${SHORT_SHA}\` (${BUILD_DATE}), base version v${CARGO_VERSION}. This preview contains the latest development changes and may be unstable.
+
+          ### Downloads
+
+          | File | Description | Checksum |
+          |---|---|---|
+          | \`Kaku-nightly.dmg\` | macOS Universal Preview Disk Image | \`Kaku-nightly.dmg.sha256\` |
+          | \`kaku_for_update.zip\` | In-app Auto Update Archive | \`kaku_for_update.zip.sha256\` |
+
+          ### Recent Commits
+
+          EOF
+
+          LAST_STABLE=$(git tag -l 'v*' 'V*' --sort=-v:refname | head -n1 || true)
+          if [ -n "$LAST_STABLE" ]; then
+            git log "$LAST_STABLE..HEAD" --no-merges --pretty=format:"* %s (%h)" | head -n 30 >> "$NOTES_FILE" || true
+          else
+            git log -n 20 --no-merges --pretty=format:"* %s (%h)" >> "$NOTES_FILE"
+          fi
+
+          echo -e "\n\n> https://github.com/${{ github.repository }}" >> "$NOTES_FILE"
+          echo "notes_path=$NOTES_FILE" >> "$GITHUB_OUTPUT"
+
+      - name: Publish Nightly Release
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87238604da99376a6cb63 # v2.2.1
+        with:
+          tag_name: nightly
+          name: Nightly Preview (${{ steps.notes.outputs.date || github.sha }})
+          body_path: ${{ steps.notes.outputs.notes_path }}
+          prerelease: true
+          draft: false
+          files: |
+            dist/Kaku-nightly.dmg
+            dist/kaku_for_update.zip
+            dist/Kaku-nightly.dmg.sha256
+            dist/kaku_for_update.zip.sha256
+            dist/sha256sums.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
