@@ -150,6 +150,7 @@ impl Window {
     }
 
     fn do_remove_idx(&mut self, idx: usize, active: Option<Arc<Tab>>) -> Arc<Tab> {
+        let mut want_active = None;
         if let (Some(active), Some(removing)) = (&active, self.tabs.get(idx)) {
             if active.tab_id() == removing.tab_id()
                 && config::configuration().switch_to_last_active_tab_when_closing_tab
@@ -158,10 +159,19 @@ impl Window {
                 // the previously active tab
                 if let Some(last_active) = self.get_last_active_idx() {
                     self.set_active_without_saving(last_active);
+                    // `last_active` indexes the list as it stands *before* the
+                    // removal below. Every tab after `idx` shifts down one, so
+                    // remember which tab we meant and re-resolve it afterwards.
+                    want_active = self.tabs.get(last_active).map(|tab| tab.tab_id());
                 }
             }
         }
         let tab = self.tabs.remove(idx);
+        if let Some(target) = want_active.and_then(|tab_id| self.idx_by_id(tab_id)) {
+            // Index-only correction: set_active_without_saving already ran the
+            // focus bookkeeping above, while the closing tab was still here.
+            self.active = target;
+        }
         self.fixup_active_tab_after_removal(active);
         tab
     }
@@ -264,5 +274,72 @@ impl Window {
         if invalidated {
             self.invalidate();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tab::Tab;
+    use wezterm_term::TerminalSize;
+
+    struct ResetMux;
+
+    impl Drop for ResetMux {
+        fn drop(&mut self) {
+            Mux::shutdown();
+        }
+    }
+
+    fn window_with_tabs(count: usize) -> (Window, Vec<Arc<Tab>>) {
+        let size = TerminalSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 800,
+            pixel_height: 600,
+            dpi: 96,
+        };
+
+        let mut window = Window::new(Some("default".to_string()), None);
+        let tabs: Vec<Arc<Tab>> = (0..count).map(|_| Arc::new(Tab::new(&size))).collect();
+        for tab in &tabs {
+            window.push(tab);
+        }
+        (window, tabs)
+    }
+
+    /// Closing the active tab with `switch_to_last_active_tab_when_closing_tab`
+    /// must land on the tab the user was on before, not on its neighbour: the
+    /// last-active index is resolved before the removal shifts everything after
+    /// the closed tab down by one.
+    #[test]
+    fn closing_active_tab_activates_last_active_tab() {
+        let mut cfg = config::Config::default_config();
+        cfg.switch_to_last_active_tab_when_closing_tab = true;
+        config::use_this_configuration(cfg);
+
+        let mux = Arc::new(Mux::new(None));
+        Mux::set_mux(&mux);
+        let _reset_mux = ResetMux;
+
+        // Last active sits *after* the tab being closed, so the indices shift.
+        let (mut window, tabs) = window_with_tabs(4);
+        window.save_and_then_set_active(2);
+        window.save_and_then_set_active(0);
+        window.remove_by_id(tabs[0].tab_id());
+        assert_eq!(
+            window.get_active().map(|tab| tab.tab_id()),
+            Some(tabs[2].tab_id())
+        );
+
+        // Last active sits *before* the tab being closed; nothing shifts.
+        let (mut window, tabs) = window_with_tabs(4);
+        window.save_and_then_set_active(1);
+        window.save_and_then_set_active(3);
+        window.remove_by_id(tabs[3].tab_id());
+        assert_eq!(
+            window.get_active().map(|tab| tab.tab_id()),
+            Some(tabs[1].tab_id())
+        );
     }
 }

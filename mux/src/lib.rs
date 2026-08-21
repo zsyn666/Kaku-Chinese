@@ -238,6 +238,49 @@ impl PaneOutputNotifyState {
     }
 }
 
+#[derive(Default)]
+struct SynchronizedOutputState {
+    active: bool,
+    last_activity: Option<Instant>,
+}
+
+impl SynchronizedOutputState {
+    fn begin(&mut self, now: Instant) {
+        self.active = true;
+        self.last_activity = Some(now);
+    }
+
+    fn end(&mut self) {
+        self.active = false;
+        self.last_activity = None;
+    }
+
+    fn note_activity(&mut self, now: Instant) {
+        if self.active {
+            self.last_activity = Some(now);
+        }
+    }
+
+    fn time_until_due(
+        &self,
+        now: Instant,
+        timeout_ms: u64,
+        has_buffered_actions: bool,
+    ) -> Option<Duration> {
+        if !self.active || timeout_ms == 0 || !has_buffered_actions {
+            return None;
+        }
+        let last_activity = self.last_activity?;
+        let timeout = Duration::from_millis(timeout_ms);
+        Some(timeout.saturating_sub(now.duration_since(last_activity)))
+    }
+
+    fn is_due(&self, now: Instant, timeout_ms: u64, has_buffered_actions: bool) -> bool {
+        self.time_until_due(now, timeout_ms, has_buffered_actions)
+            .is_some_and(|remaining| remaining.is_zero())
+    }
+}
+
 /// This function applies parsed actions to the pane. The caller is
 /// responsible for subsequently notifying mux subscribers via the
 /// throttled `PaneOutputNotifyState::maybe_notify` path.
@@ -304,8 +347,7 @@ fn parse_buffered_data(
     let mut buf = vec![0; configuration().mux_output_parser_buffer_size];
     let mut parser = termwiz::escape::parser::Parser::new();
     let mut actions = vec![];
-    let mut hold = false;
-    let mut hold_start: Option<Instant> = None;
+    let mut synchronized_output = SynchronizedOutputState::default();
     let mut action_size = 0;
     let mut delay = Duration::from_millis(configuration().mux_output_parser_coalesce_delay_ms);
     let mut deadline = None;
@@ -342,15 +384,34 @@ fn parse_buffered_data(
         let base_timeout = Duration::from_millis(200);
         // Clamp to 1 ms floor so a remaining of Duration::ZERO never puts
         // poll into non-blocking mode and burns a tight spin iteration.
-        let poll_timeout = match notify_state.time_until_due() {
-            Some(remaining) => base_timeout.min(remaining.max(Duration::from_millis(1))),
-            None => base_timeout,
-        };
+        let config = configuration();
+        let sync_remaining = synchronized_output.time_until_due(
+            Instant::now(),
+            config.mux_synchronized_output_timeout_ms,
+            !actions.is_empty(),
+        );
+        let poll_timeout = [notify_state.time_until_due(), sync_remaining]
+            .iter()
+            .flatten()
+            .copied()
+            .fold(base_timeout, |timeout, remaining| {
+                timeout.min(remaining.max(Duration::from_millis(1)))
+            });
         match poll(&mut pfd, Some(poll_timeout)) {
             Ok(0) => {
-                // Timeout, flush any deferred notify then loop back to
-                // check the dead flag.
+                // Keep an actively arriving synchronized frame atomic even
+                // when a slow SSH link makes its total duration exceed the
+                // timeout. Only release the frame after actual inactivity.
                 notify_state.flush(pane_id);
+                if synchronized_output.is_due(
+                    Instant::now(),
+                    config.mux_synchronized_output_timeout_ms,
+                    !actions.is_empty(),
+                ) {
+                    send_actions_to_mux(&pane, pane_id, &dead, std::mem::take(&mut actions));
+                    notify_state.maybe_notify(pane_id);
+                    action_size = 0;
+                }
                 continue;
             }
             Ok(_) if pfd[0].revents & POLLIN == 0 => {
@@ -381,8 +442,7 @@ fn parse_buffered_data(
                         Action::CSI(CSI::Mode(Mode::SetDecPrivateMode(DecPrivateMode::Code(
                             DecPrivateModeCode::SynchronizedOutput,
                         )))) => {
-                            hold = true;
-                            hold_start = Some(Instant::now());
+                            synchronized_output.begin(Instant::now());
 
                             // Flush prior actions
                             if !actions.is_empty() {
@@ -399,13 +459,11 @@ fn parse_buffered_data(
                         Action::CSI(CSI::Mode(Mode::ResetDecPrivateMode(
                             DecPrivateMode::Code(DecPrivateModeCode::SynchronizedOutput),
                         ))) => {
-                            hold = false;
-                            hold_start = None;
+                            synchronized_output.end();
                             flush = true;
                         }
                         Action::CSI(CSI::Device(dev)) if matches!(**dev, Device::SoftReset) => {
-                            hold = false;
-                            hold_start = None;
+                            synchronized_output.end();
                             flush = true;
                         }
                         _ => {}
@@ -419,25 +477,18 @@ fn parse_buffered_data(
                     }
                 });
                 action_size += size;
-                // Force-flush if synchronized output hold has exceeded timeout
-                // or accumulated data exceeds 1MB, whichever comes first.
-                if hold && !actions.is_empty() {
-                    let timeout_ms = configuration().mux_synchronized_output_timeout_ms;
-                    let timed_out = timeout_ms > 0
-                        && hold_start
-                            .map(|s| s.elapsed() >= Duration::from_millis(timeout_ms))
-                            .unwrap_or(false);
-                    // 1MB cap guards against unbounded growth when timeout_ms == 0
-                    // or when a fast producer fills the buffer before the timeout fires.
+                synchronized_output.note_activity(Instant::now());
+                // Keep a hard 1MB cap even while output is active so a producer
+                // cannot grow the synchronized frame without bound.
+                if synchronized_output.active && !actions.is_empty() {
                     let size_exceeded = action_size > 1_048_576;
-                    if timed_out || size_exceeded {
+                    if size_exceeded {
                         send_actions_to_mux(&pane, pane_id, &dead, std::mem::take(&mut actions));
                         notify_state.maybe_notify(pane_id);
                         action_size = 0;
-                        hold_start = Some(Instant::now());
                     }
                 }
-                if !actions.is_empty() && !hold {
+                if !actions.is_empty() && !synchronized_output.active {
                     // If we haven't accumulated too much data,
                     // pause for a short while to increase the chances
                     // that we coalesce a full "frame" from an unoptimized
@@ -1924,5 +1975,68 @@ impl wezterm_term::DownloadHandler for MuxDownloader {
                 data: Arc::new(data),
             });
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SynchronizedOutputState;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn synchronized_output_timeout_tracks_idle_time_not_total_frame_time() {
+        let start = Instant::now();
+        let mut state = SynchronizedOutputState::default();
+        state.begin(start);
+        state.note_activity(start + Duration::from_millis(900));
+
+        assert!(!state.is_due(start + Duration::from_millis(1100), 1000, true));
+        assert_eq!(
+            state.time_until_due(start + Duration::from_millis(1100), 1000, true),
+            Some(Duration::from_millis(800))
+        );
+        assert!(state.is_due(start + Duration::from_millis(1900), 1000, true));
+    }
+
+    #[test]
+    fn synchronized_output_slow_37kb_frame_stays_held_while_bytes_arrive() {
+        let start = Instant::now();
+        let mut state = SynchronizedOutputState::default();
+        state.begin(start);
+
+        for chunk in 1..=37 {
+            let now = start + Duration::from_millis(chunk * 100);
+            state.note_activity(now);
+            assert!(
+                !state.is_due(now, 1000, true),
+                "active chunk {} must not split the synchronized frame",
+                chunk
+            );
+        }
+
+        assert!(!state.is_due(start + Duration::from_millis(4600), 1000, true));
+        assert!(state.is_due(start + Duration::from_millis(4700), 1000, true));
+    }
+
+    #[test]
+    fn synchronized_output_timeout_requires_buffered_actions() {
+        let start = Instant::now();
+        let mut state = SynchronizedOutputState::default();
+        state.begin(start);
+
+        assert_eq!(
+            state.time_until_due(start + Duration::from_secs(2), 1000, false),
+            None
+        );
+    }
+
+    #[test]
+    fn synchronized_output_end_cancels_the_timeout() {
+        let start = Instant::now();
+        let mut state = SynchronizedOutputState::default();
+        state.begin(start);
+        state.end();
+
+        assert!(!state.is_due(start + Duration::from_secs(2), 1000, true));
     }
 }

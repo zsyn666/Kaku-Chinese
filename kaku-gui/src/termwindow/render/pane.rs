@@ -548,8 +548,7 @@ impl crate::TermWindow {
                     // Constrain to the pane width!
                     let selrange = selrange.start..selrange.end.min(self.dims.cols);
                     let show_terminal_cursor = self.term_window.get_modal().is_none();
-                    let pane_is_active_for_cursor = show_terminal_cursor
-                        && (self.pos.is_active || self.term_window.broadcast_input_visual_mode());
+                    let pane_is_active_for_cursor = show_terminal_cursor && self.pos.is_active;
 
                     let (cursor, composing, password_input) = if pane_is_active_for_cursor
                         && self.cursor.y == stable_row

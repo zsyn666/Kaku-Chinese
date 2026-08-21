@@ -1181,6 +1181,34 @@ return tab, {{ tab }}, panes, effective_config
     }
 
     #[test]
+    fn bundled_kaku_lazygit_dispatch_does_not_require_outer_pane_git_cwd() {
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../assets/macos/Kaku.app/Contents/Resources/kaku.lua");
+        let content = std::fs::read_to_string(&bundled).expect("read bundled kaku.lua");
+        let launch_start = content
+            .find("local function launch_lazygit(window, pane)")
+            .expect("bundled kaku.lua should define launch_lazygit");
+        let launch = &content[launch_start..];
+        let launch_end = launch
+            .find("\nlocal function launch_yazi")
+            .expect("launch_lazygit should end before launch_yazi");
+        let launch = &launch[..launch_end];
+
+        assert!(
+            !launch.contains("detect_git_repo_root(path)"),
+            "lazygit dispatch must not reject an outer pane cwd; nested shells own their real PWD"
+        );
+        assert!(
+            !launch.contains("kaku-toast-lazygit-not-git"),
+            "lazygit dispatch must let lazygit report non-git directories itself"
+        );
+        assert!(
+            launch.contains("wezterm.action.SendString(\"\\x15\" .. lazygit_cmd .. \"\\r\")"),
+            "lazygit dispatch should retain the clear-line then command send sequence"
+        );
+    }
+
+    #[test]
     fn bundled_kaku_lua_sets_colorfgbg_from_user_theme_scan() {
         let bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../assets/macos/Kaku.app/Contents/Resources/kaku.lua");
@@ -1259,6 +1287,18 @@ return tab, {{ tab }}, panes, effective_config
                 && content.contains("['#15141b'] = KAKU.WHITE")
                 && content.contains("['#1c1c1c'] = KAKU.WHITE"),
             "Kaku Dark should render Hermes black foregrounds as readable light text"
+        );
+    }
+
+    #[test]
+    fn bundled_kaku_light_keeps_claude_selection_visibly_blue() {
+        let bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../assets/macos/Kaku.app/Contents/Resources/kaku.lua");
+        let content = std::fs::read_to_string(&bundled).expect("read bundled kaku.lua");
+
+        assert!(
+            content.contains("['#205EA6'] = '#C9DDF0'"),
+            "Kaku Light should not flatten Claude Code's blue selected row into the cream background"
         );
     }
 }

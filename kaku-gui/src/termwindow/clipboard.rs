@@ -180,13 +180,9 @@ impl TermWindow {
     }
 
     pub fn paste_from_clipboard(&mut self, pane: &Arc<dyn Pane>, clipboard: ClipboardPasteSource) {
-        let targets = self.terminal_input_targets(pane);
-        let pane_ids: Vec<_> = targets.iter().map(|pane| pane.pane_id()).collect();
-        log::trace!(
-            "paste_from_clipboard in panes {:?} {:?}",
-            pane_ids,
-            clipboard
-        );
+        let target_pane = pane.clone();
+        let pane_id = target_pane.pane_id();
+        log::trace!("paste_from_clipboard in pane {pane_id} {clipboard:?}");
         let window = self.window.as_ref().unwrap().clone();
         let clipboard = match clipboard {
             ClipboardPasteSource::Clipboard => Clipboard::Clipboard,
@@ -204,14 +200,11 @@ impl TermWindow {
                             // apps), forward a Ctrl+V byte so the TUI app can
                             // read the system clipboard image itself, using the same
                             // path that a real Ctrl+V keypress takes.
-                            for pane in &targets {
-                                let result = pane.writer().write_all(b"\x16");
-                                if let Err(err) = myself.finish_terminal_input(pane, result) {
-                                    log::warn!(
-                                        "failed to send ctrl-v for image paste to pane {}: {err:#}",
-                                        pane.pane_id()
-                                    );
-                                }
+                            let result = target_pane.writer().write_all(b"\x16");
+                            if let Err(err) = myself.finish_terminal_input(&target_pane, result) {
+                                log::warn!(
+                                    "failed to send ctrl-v for image paste to pane {pane_id}: {err:#}"
+                                );
                             }
                             return;
                         }
@@ -220,19 +213,16 @@ impl TermWindow {
                             None => return,
                         };
 
-                        for pane in &targets {
-                            let result = pane.send_paste(&clip);
-                            if let Err(err) = myself.finish_terminal_input(pane, result) {
-                                log::warn!(
-                                    "failed to paste clipboard content into pane {}: {err:#}",
-                                    pane.pane_id()
-                                );
-                            }
+                        let result = target_pane.send_paste(&clip);
+                        if let Err(err) = myself.finish_terminal_input(&target_pane, result) {
+                            log::warn!(
+                                "failed to paste clipboard content into pane {pane_id}: {err:#}"
+                            );
                         }
                     })));
                 }
                 Err(err) => {
-                    log::warn!("failed to read clipboard for panes {:?}: {err:#}", pane_ids);
+                    log::warn!("failed to read clipboard for pane {pane_id}: {err:#}");
                 }
             }
         })

@@ -246,8 +246,6 @@ impl CommandDef {
             ActivateTabRelative(-1),
             ActivateTabRelative(1),
             ActivateLastTab,
-            ToggleCurrentTabPanesInputBroadcast,
-            ToggleAllPanesInputBroadcast,
             MoveTabRelative(-1),
             MoveTabRelative(1),
             MoveTabToNewWindow,
@@ -775,8 +773,6 @@ impl CommandDef {
                     ActivateTabRelative(1) => 31,
                     ActivateLastTab => 32,
                     ShowTabNavigator => 33,
-                    ToggleCurrentTabPanesInputBroadcast => 34,
-                    ToggleAllPanesInputBroadcast => 35,
                     MoveTabRelative(-1) => 40,
                     MoveTabRelative(1) => 41,
                     PaneSelect(PaneSelectArguments {
@@ -1784,7 +1780,9 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             brief: "Restore Previous Window".into(),
             doc: "Restores the last saved window snapshot, including tabs and panes.".into(),
             keys: vec![(
-                Modifiers::SUPER.union(Modifiers::ALT).union(Modifiers::SHIFT),
+                Modifiers::SUPER
+                    .union(Modifiers::ALT)
+                    .union(Modifiers::SHIFT),
                 "t".into(),
             )],
             args: &[ArgType::ActiveWindow],
@@ -2255,22 +2253,6 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &["Window"],
             icon: None,
         },
-        ToggleCurrentTabPanesInputBroadcast => CommandDef {
-            brief: "Toggle Current Tab Panes".into(),
-            doc: "Toggle broadcasting terminal keyboard input to every visible pane in the current tab.".into(),
-            keys: vec![(Modifiers::SUPER.union(Modifiers::ALT), "i".into())],
-            args: &[ArgType::ActiveWindow],
-            menubar: &["Window"],
-            icon: None,
-        },
-        ToggleAllPanesInputBroadcast => CommandDef {
-            brief: "Toggle All Panes (All Tabs)".into(),
-            doc: "Toggle broadcasting terminal keyboard input to every visible pane in every tab in the current window.".into(),
-            keys: vec![(Modifiers::SUPER.union(Modifiers::SHIFT), "i".into())],
-            args: &[ArgType::ActiveWindow],
-            menubar: &["Window"],
-            icon: None,
-        },
         ClearKeyTableStack => CommandDef {
             brief: "Clear the key table stack".into(),
             doc: "Removes all entries from the stack".into(),
@@ -2436,7 +2418,9 @@ pub fn derive_command_from_key_assignment(action: &KeyAssignment) -> Option<Comm
             menubar: &[],
             icon: None,
         },
-        DisableDefaultAssignment => return None,
+        DisableDefaultAssignment
+        | ToggleCurrentTabPanesInputBroadcast
+        | ToggleAllPanesInputBroadcast => return None,
         SelectTextAtMouseCursor(mode) => CommandDef {
             brief: format!(
                 "Selects text at the mouse cursor \
@@ -2835,8 +2819,6 @@ fn compute_default_actions() -> Vec<KeyAssignment> {
         TogglePaneZoomState,
         ActivateLastTab,
         ShowTabNavigator,
-        ToggleCurrentTabPanesInputBroadcast,
-        ToggleAllPanesInputBroadcast,
         // ----------------- Help
         OpenUri("https://github.com/tw93/Kaku".to_string()),
         OpenUri("https://github.com/tw93/Kaku/issues/".to_string()),
@@ -2862,44 +2844,27 @@ mod tests {
     use window::Modifiers;
 
     #[test]
-    fn toggle_current_tab_panes_input_broadcast_has_default_shortcut() {
-        let cmd =
-            derive_command_from_key_assignment(&KeyAssignment::ToggleCurrentTabPanesInputBroadcast)
-                .expect("command");
-
-        assert_eq!(
-            cmd.keys,
-            vec![(Modifiers::SUPER.union(Modifiers::ALT), "i".into())]
-        );
-    }
-
-    #[test]
-    fn toggle_all_panes_input_broadcast_has_default_shortcut() {
-        let cmd = derive_command_from_key_assignment(&KeyAssignment::ToggleAllPanesInputBroadcast)
-            .expect("command");
-
-        assert_eq!(
-            cmd.keys,
-            vec![(Modifiers::SUPER.union(Modifiers::SHIFT), "i".into())]
-        );
-    }
-
-    #[test]
-    fn toggle_current_tab_panes_input_broadcast_is_in_default_assignments() {
+    fn deprecated_input_broadcast_actions_are_not_exposed() {
         let config = ConfigHandle::default_config();
+        let deprecated_actions = [
+            KeyAssignment::ToggleCurrentTabPanesInputBroadcast,
+            KeyAssignment::ToggleAllPanesInputBroadcast,
+        ];
 
-        assert!(CommandDef::default_key_assignments(&config)
+        for action in deprecated_actions {
+            assert!(derive_command_from_key_assignment(&action).is_none());
+            assert!(!CommandDef::default_key_assignments(&config)
+                .iter()
+                .any(|(_, _, default_action)| *default_action == action));
+        }
+
+        assert!(CommandDef::actions_for_palette_only(&config)
             .iter()
-            .any(|(_, _, action)| *action == KeyAssignment::ToggleCurrentTabPanesInputBroadcast));
-    }
-
-    #[test]
-    fn toggle_all_panes_input_broadcast_is_in_default_assignments() {
-        let config = ConfigHandle::default_config();
-
-        assert!(CommandDef::default_key_assignments(&config)
-            .iter()
-            .any(|(_, _, action)| *action == KeyAssignment::ToggleAllPanesInputBroadcast));
+            .all(|command| !matches!(
+                command.action,
+                KeyAssignment::ToggleCurrentTabPanesInputBroadcast
+                    | KeyAssignment::ToggleAllPanesInputBroadcast
+            )));
     }
 
     #[test]

@@ -682,6 +682,13 @@ impl Tab {
         self.inner.try_lock().map(|mut inner| inner.count_panes())
     }
 
+    /// Like `count_panes`, but waits for the lock instead of reporting "busy".
+    /// Callers that branch on the answer (close this pane, or close the whole
+    /// tab?) cannot treat a contended lock as "more than one pane".
+    pub fn count_panes_blocking(&self) -> usize {
+        self.inner.lock().count_panes()
+    }
+
     /// Sets the zoom state, returns the prior state
     pub fn set_zoomed(&self, zoomed: bool) -> bool {
         self.inner.lock().set_zoomed(zoomed)

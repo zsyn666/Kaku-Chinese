@@ -146,17 +146,44 @@ impl SavedPaneNode {
     ) -> anyhow::Result<Self> {
         match node {
             PaneNode::Empty => Ok(Self::Empty),
-            PaneNode::Split { left, right, node } => Ok(Self::Split {
-                left: Box::new(Self::from_live(*left, mux, content_dir)?),
-                right: Box::new(Self::from_live(*right, mux, content_dir)?),
+            PaneNode::Split { left, right, node } => Ok(Self::collapse_split(
+                Self::from_live(*left, mux, content_dir)?,
+                Self::from_live(*right, mux, content_dir)?,
                 node,
-            }),
-            PaneNode::Leaf(entry) => Ok(Self::Leaf(SavedPaneEntry::from_live(
-                entry,
-                mux,
-                content_dir,
-            )?)),
+            )),
+            PaneNode::Leaf(entry) => {
+                let pane_id = entry.pane_id;
+                // A pane can sit in the tab tree while already gone from the
+                // mux (just closed and not pruned yet, or a detached domain).
+                // Failing the whole tree there would silently drop every other
+                // tab in this window from the snapshot, so drop just this leaf.
+                match SavedPaneEntry::from_live(entry, mux, content_dir) {
+                    Ok(entry) => Ok(Self::Leaf(entry)),
+                    Err(err) => {
+                        log::warn!("session snapshot skips pane {pane_id}: {err:#}");
+                        Ok(Self::Empty)
+                    }
+                }
+            }
         }
+    }
+
+    /// Rebuild a split from its saved halves, collapsing onto whichever half
+    /// survived when the other could not be captured.
+    fn collapse_split(left: Self, right: Self, node: SplitDirectionAndSize) -> Self {
+        match (left, right) {
+            (Self::Empty, right) => right,
+            (left, Self::Empty) => left,
+            (left, right) => Self::Split {
+                left: Box::new(left),
+                right: Box::new(right),
+                node,
+            },
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
     }
 
     fn root_size(&self) -> Option<TerminalSize> {
@@ -676,6 +703,17 @@ fn is_window_empty(window_id: MuxWindowId) -> bool {
 
 // ---------- Snapshot building ----------
 
+/// Map the live active-tab index onto the subset of tabs that made it into the
+/// snapshot. `retained` holds the original indices, ascending. When the active
+/// tab itself was dropped, fall back to the nearest retained tab before it.
+fn retained_active_idx(original_active: usize, retained: &[usize]) -> usize {
+    retained
+        .iter()
+        .take_while(|&&idx| idx <= original_active)
+        .count()
+        .saturating_sub(1)
+}
+
 fn build_snapshot_for_window(
     window_id: MuxWindowId,
     content_dir: Option<&std::path::Path>,
@@ -685,18 +723,32 @@ fn build_snapshot_for_window(
         .get_window(window_id)
         .ok_or_else(|| anyhow!("window {window_id} not found"))?;
 
-    let tabs = window
-        .iter()
-        .map(|tab| {
-            Ok(SavedTabSnapshot {
-                title: tab.get_title(),
-                pane_tree: SavedPaneNode::from_live(tab.codec_pane_tree(), &mux, content_dir)?,
-            })
-        })
-        .collect::<anyhow::Result<Vec<_>>>()?;
+    let mut tabs = Vec::new();
+    let mut retained = Vec::new();
+    for (idx, tab) in window.iter().enumerate() {
+        let pane_tree = SavedPaneNode::from_live(tab.codec_pane_tree(), &mux, content_dir)?;
+        if pane_tree.is_empty() {
+            // Every pane in this tab was unresolvable; restoring it would
+            // produce a tab with nothing in it.
+            log::warn!(
+                "session snapshot skips tab {} of window {window_id}: no restorable panes",
+                tab.tab_id()
+            );
+            continue;
+        }
+        tabs.push(SavedTabSnapshot {
+            title: tab.get_title(),
+            pane_tree,
+        });
+        retained.push(idx);
+    }
+
+    if tabs.is_empty() {
+        return Err(anyhow!("window {window_id} has no restorable tabs"));
+    }
 
     Ok(SavedWindowSnapshot {
-        active_tab_idx: window.get_active_idx(),
+        active_tab_idx: retained_active_idx(window.get_active_idx(), &retained),
         window_title: window.get_title().to_string(),
         is_focused: focused_window_id() == Some(window_id),
         tabs,
@@ -1328,6 +1380,84 @@ mod tests {
         SerdeUrl {
             url: url::Url::parse(s).unwrap(),
         }
+    }
+
+    fn leaf(pane_id: usize) -> SavedPaneNode {
+        SavedPaneNode::Leaf(SavedPaneEntry {
+            window_id: 0,
+            tab_id: TabId::new(0),
+            pane_id: PaneId::new(pane_id),
+            title: String::new(),
+            size: TerminalSize::default(),
+            working_dir: None,
+            domain_name: "local".to_string(),
+            is_active_pane: true,
+            is_zoomed_pane: false,
+            workspace: "default".to_string(),
+            content_ref: None,
+        })
+    }
+
+    fn split_node() -> SplitDirectionAndSize {
+        SplitDirectionAndSize {
+            direction: mux::tab::SplitDirection::Horizontal,
+            first: TerminalSize::default(),
+            second: TerminalSize::default(),
+        }
+    }
+
+    /// One unresolvable pane must cost only that pane, not the split it lived
+    /// in and not the rest of the window.
+    #[test]
+    fn split_collapses_onto_the_surviving_pane() {
+        let survivor = |node: SavedPaneNode| match node {
+            SavedPaneNode::Leaf(entry) => Some(entry.pane_id),
+            _ => None,
+        };
+
+        assert_eq!(
+            survivor(SavedPaneNode::collapse_split(
+                SavedPaneNode::Empty,
+                leaf(7),
+                split_node()
+            )),
+            Some(PaneId::new(7))
+        );
+
+        assert_eq!(
+            survivor(SavedPaneNode::collapse_split(
+                leaf(7),
+                SavedPaneNode::Empty,
+                split_node()
+            )),
+            Some(PaneId::new(7))
+        );
+
+        assert!(SavedPaneNode::collapse_split(
+            SavedPaneNode::Empty,
+            SavedPaneNode::Empty,
+            split_node()
+        )
+        .is_empty());
+
+        assert!(matches!(
+            SavedPaneNode::collapse_split(leaf(7), leaf(8), split_node()),
+            SavedPaneNode::Split { .. }
+        ));
+    }
+
+    #[test]
+    fn active_tab_idx_follows_the_retained_tabs() {
+        // Nothing dropped: the index is unchanged.
+        assert_eq!(retained_active_idx(2, &[0, 1, 2, 3]), 2);
+        // A tab before the active one was dropped: shift down with it.
+        assert_eq!(retained_active_idx(2, &[0, 2, 3]), 1);
+        // Only tabs after the active one were dropped.
+        assert_eq!(retained_active_idx(1, &[0, 1]), 1);
+        // The active tab itself was dropped: land on the nearest one before it.
+        assert_eq!(retained_active_idx(2, &[0, 1, 3]), 1);
+        // The active tab was the first one and it was dropped.
+        assert_eq!(retained_active_idx(0, &[1, 2]), 0);
     }
 
     #[test]

@@ -672,7 +672,11 @@ pub enum KeyAssignment {
     ResetFontAndWindowSize,
     ActivateTab(isize),
     ActivateLastTab,
+    /// Deprecated compatibility action. Pane input broadcast was removed;
+    /// this action is accepted from older configs but has no effect.
     ToggleCurrentTabPanesInputBroadcast,
+    /// Deprecated compatibility action. Pane input broadcast was removed;
+    /// this action is accepted from older configs but has no effect.
     ToggleAllPanesInputBroadcast,
     SendString(String),
     /// Write the given string to the pty only when the active pane is NOT
@@ -869,7 +873,7 @@ pub struct KeyTableEntry {
 
 #[cfg(test)]
 mod tests {
-    use super::PaneEncoding;
+    use super::{KeyAssignment, PaneEncoding};
     use std::sync::Mutex;
 
     lazy_static::lazy_static! {
@@ -905,6 +909,14 @@ mod tests {
                 PaneEncoding::ShiftJis,
             ]
         );
+    }
+
+    #[test]
+    fn deprecated_input_broadcast_actions_remain_parseable() {
+        let variants = KeyAssignment::variants();
+
+        assert!(variants.contains(&"ToggleCurrentTabPanesInputBroadcast"));
+        assert!(variants.contains(&"ToggleAllPanesInputBroadcast"));
     }
 
     #[test]

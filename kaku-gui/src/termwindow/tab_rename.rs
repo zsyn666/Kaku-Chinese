@@ -2,9 +2,10 @@ use crate::customglyph::{BlockAlpha, BlockCoord, Poly, PolyCommand, PolyStyle};
 use crate::termwindow::box_model::*;
 use crate::termwindow::modal::Modal;
 use crate::termwindow::render::corners::{TOP_LEFT_ROUNDED_CORNER, TOP_RIGHT_ROUNDED_CORNER};
-use crate::termwindow::{TermWindow, UIItem};
+use crate::termwindow::{TermWindow, TermWindowNotif, UIItem};
 use crate::utilsprites::RenderMetrics;
 use anyhow::Context;
+use config::keyassignment::{ClipboardCopyDestination, ClipboardPasteSource, KeyAssignment};
 use config::{Dimension, DimensionContext, TabBarColors};
 use mux::tab::TabId;
 use mux::Mux;
@@ -15,7 +16,7 @@ use termwiz::surface::SEQ_ZERO;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
 use wezterm_term::{KeyCode, KeyModifiers, Line, MouseEvent};
 use window::color::LinearRgba;
-use window::{DeadKeyStatus, Point, Rect, Size, WindowOps};
+use window::{Clipboard, DeadKeyStatus, Point, Rect, Size, WindowOps};
 
 const INLINE_CURSOR: &[Poly] = &[Poly {
     path: &[
@@ -31,6 +32,11 @@ pub struct TabRenameModal {
     tab_id: TabId,
     anchor: UIItem,
     value: RefCell<String>,
+    /// The value the editor opened with. The editor is prefilled with the
+    /// title the tab bar currently computes, so committing an untouched
+    /// value would pin that text as an explicit title and freeze the tab
+    /// name against later pane, cwd, and process changes.
+    initial: String,
     cursor: RefCell<usize>,
     selection: RefCell<Option<(usize, usize)>>,
     /// Timestamp of the last cursor movement; the blink cycle restarts
@@ -74,6 +80,7 @@ impl TabRenameModal {
             element: RefCell::new(None),
             tab_id,
             anchor,
+            initial: value.clone(),
             value: RefCell::new(value),
             cursor: RefCell::new(cursor),
             selection: RefCell::new(None),
@@ -209,6 +216,90 @@ impl TabRenameModal {
         true
     }
 
+    /// Text covered by the selection, empty when nothing is selected.
+    fn selected_text(&self) -> String {
+        let Some((start, end)) = self.selection_bounds() else {
+            return String::new();
+        };
+        self.value
+            .borrow()
+            .chars()
+            .skip(start)
+            .take(end.saturating_sub(start))
+            .collect()
+    }
+
+    /// A tab title is a single line of display text, so a pasted value keeps
+    /// only its first line and drops control characters that would corrupt the
+    /// tab bar layout.
+    fn sanitize_pasted(text: &str) -> String {
+        text.lines()
+            .next()
+            .unwrap_or("")
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect()
+    }
+
+    fn insert_str(&self, text: &str) {
+        let text = Self::sanitize_pasted(text);
+        if text.is_empty() {
+            return;
+        }
+        let _ = self.delete_selection();
+        self.mark_movement();
+        let mut value = self.value.borrow_mut();
+        let mut cursor = self.cursor.borrow_mut();
+        let byte_idx = Self::byte_idx_for_char(&value, *cursor);
+        value.insert_str(byte_idx, &text);
+        *cursor += text.chars().count();
+        self.clear_selection();
+    }
+
+    fn cut(&self, term_window: &TermWindow) -> bool {
+        let text = self.selected_text();
+        if text.is_empty() {
+            return false;
+        }
+        term_window.copy_to_clipboard(ClipboardCopyDestination::Clipboard, text);
+        self.delete_selection()
+    }
+
+    /// Reading the clipboard is asynchronous, so the text lands back here via
+    /// the window notification queue. By then the user may have dismissed this
+    /// editor or opened another modal, hence the identity check on arrival.
+    fn paste_from(&self, source: ClipboardPasteSource, term_window: &TermWindow) {
+        let Some(window) = term_window.window.as_ref().cloned() else {
+            return;
+        };
+        let clipboard = match source {
+            ClipboardPasteSource::Clipboard => Clipboard::Clipboard,
+            ClipboardPasteSource::PrimarySelection => Clipboard::PrimarySelection,
+        };
+        let tab_id = self.tab_id;
+        let future = window.get_clipboard(clipboard);
+        promise::spawn::spawn(async move {
+            match future.await {
+                Ok(text) => {
+                    window.notify(TermWindowNotif::Apply(Box::new(move |term_window| {
+                        let Some(modal) = term_window.get_modal() else {
+                            return;
+                        };
+                        match modal.downcast_ref::<TabRenameModal>() {
+                            Some(rename) if rename.tab_id == tab_id => rename.insert_str(&text),
+                            _ => return,
+                        }
+                        term_window.invalidate_modal();
+                    })));
+                }
+                Err(err) => {
+                    log::warn!("failed to read clipboard for tab rename: {err:#}");
+                }
+            }
+        })
+        .detach();
+    }
+
     fn insert_char(&self, c: char) {
         let _ = self.delete_selection();
         self.mark_movement();
@@ -330,12 +421,25 @@ impl TabRenameModal {
     }
 
     fn commit(&self, term_window: &mut TermWindow) {
+        let value = self.value.borrow().clone();
+        if !Self::should_apply(&self.initial, &value) {
+            term_window.cancel_modal();
+            return;
+        }
         if let Some(tab) = Mux::get().get_tab(self.tab_id) {
-            tab.set_title(self.value.borrow().as_str());
+            tab.set_title(&value);
         }
         // Sync rebuild so hit-test regions match the new width before paint (#443).
         term_window.update_title_impl();
         term_window.cancel_modal();
+    }
+
+    /// An untouched editor must leave the tab alone. Writing the prefilled
+    /// text back would turn the auto-computed title into an explicit one,
+    /// and an explicit title wins over every later recomputation, so a tab
+    /// that was merely double clicked would keep naming panes that are gone.
+    fn should_apply(initial: &str, value: &str) -> bool {
+        initial != value
     }
 
     fn point_in_bounds(&self, x: i64, y: i64) -> bool {
@@ -863,11 +967,34 @@ impl TabRenameModal {
 }
 
 impl Modal for TabRenameModal {
+    /// macOS routes menu key equivalents through AppKit before `keyDown` ever
+    /// reaches the window, so Cmd+C and Cmd+V arrive here rather than in
+    /// `key_down` while the editor is open. Anything this declines dismisses the
+    /// editor; see `TermWindow::perform_key_assignment`.
+    fn perform_assignment(&self, assignment: &KeyAssignment, term_window: &mut TermWindow) -> bool {
+        match assignment {
+            KeyAssignment::CopyTo(destination) => {
+                let text = self.selected_text();
+                if !text.is_empty() {
+                    term_window.copy_to_clipboard(*destination, text);
+                }
+                true
+            }
+            KeyAssignment::PasteFrom(source) => {
+                self.paste_from(*source, term_window);
+                true
+            }
+            _ => false,
+        }
+    }
+
     fn mouse_event(&self, event: MouseEvent, term_window: &mut TermWindow) -> anyhow::Result<()> {
         if event.kind == wezterm_term::MouseEventKind::Press
             && !self.point_in_bounds(event.x as i64, event.y)
         {
-            self.commit(term_window);
+            // Clicking away dismisses the editor without renaming; Enter is
+            // the only confirmation.
+            term_window.cancel_modal();
         }
         Ok(())
     }
@@ -903,6 +1030,8 @@ impl Modal for TabRenameModal {
                 self.move_to_end()
             }
             (KeyCode::Char('a'), KeyModifiers::SUPER) => self.select_all(),
+            // Cut has no menu item, so unlike copy and paste it arrives here.
+            (KeyCode::Char('x'), KeyModifiers::SUPER) => self.cut(term_window),
             (KeyCode::Char('u'), KeyModifiers::CTRL) => self.clear(),
             (KeyCode::Char(c), KeyModifiers::NONE) | (KeyCode::Char(c), KeyModifiers::SHIFT) => {
                 self.insert_char(c);
@@ -925,7 +1054,7 @@ impl Modal for TabRenameModal {
 
     fn focus_changed(&self, focused: bool, term_window: &mut TermWindow) {
         if !focused {
-            self.commit(term_window);
+            term_window.cancel_modal();
         }
     }
 
@@ -945,5 +1074,40 @@ impl Modal for TabRenameModal {
 
     fn reconfigure(&self, _term_window: &mut TermWindow) {
         self.element.borrow_mut().take();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TabRenameModal;
+
+    #[test]
+    fn untouched_editor_does_not_pin_the_computed_title() {
+        // Double clicking a split tab prefills the joined pane title; leaving
+        // it alone must not write it back, or closing a pane would keep the
+        // dead pane's name in the tab.
+        assert!(!TabRenameModal::should_apply(
+            "www/kaku∙www/kaku·claude",
+            "www/kaku∙www/kaku·claude"
+        ));
+    }
+
+    #[test]
+    fn pasted_text_stays_a_single_printable_line() {
+        // A tab title is one line of display text; a multi-line or control
+        // laden paste must not reach the tab bar.
+        assert_eq!(TabRenameModal::sanitize_pasted("build\nnotes\n"), "build");
+        assert_eq!(TabRenameModal::sanitize_pasted("a\tb\u{7}c"), "abc");
+        assert_eq!(TabRenameModal::sanitize_pasted(""), "");
+    }
+
+    #[test]
+    fn edited_value_is_applied() {
+        assert!(TabRenameModal::should_apply("www/kaku", "build"));
+    }
+
+    #[test]
+    fn clearing_the_value_is_applied_to_restore_the_auto_title() {
+        assert!(TabRenameModal::should_apply("pinned", ""));
     }
 }

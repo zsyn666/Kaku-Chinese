@@ -435,10 +435,10 @@ pub struct Config {
     #[dynamic(default = "default_mux_output_parser_coalesce_delay_ms")]
     pub mux_output_parser_coalesce_delay_ms: u64,
 
-    /// Maximum time in milliseconds to hold synchronized output (mode 2026)
-    /// before force-flushing. Prevents indefinite holds from blocking rendering
-    /// when programs send BSU without ESU (e.g., CLAUDE_CODE_NO_FLICKER).
-    /// Set to 0 to disable the timeout.
+    /// Maximum idle time in milliseconds while holding synchronized output
+    /// (mode 2026) before force-flushing. Active output resets the timer so a
+    /// slow remote frame remains atomic, while a missing end marker still
+    /// cannot block rendering indefinitely. Set to 0 to disable the timeout.
     #[dynamic(default = "default_mux_synchronized_output_timeout_ms")]
     pub mux_synchronized_output_timeout_ms: u64,
 

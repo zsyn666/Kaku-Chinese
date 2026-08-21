@@ -1,12 +1,14 @@
 ---
 name: release
-description: "Run the Kaku macOS release flow end-to-end: preflight, build, notarize, tag, upload to GitHub Releases, dispatch the Homebrew tap, or publish the rolling Nightly preview package. Source of truth is scripts/release.sh and scripts/nightly.sh; this skill is a runbook with one-time setup commands and recovery hints."
+description: "Run the Kaku macOS release flow end-to-end: preflight, build, notarize, tag, upload to GitHub Releases, dispatch the Homebrew tap, or publish the rolling Nightly preview package. Source of truth is scripts/release.sh and scripts/nightly.sh; this skill records release prerequisites and recovery hints without embedding private machine setup."
 when_to_use: "发布, 出版本, 打 tag, release Kaku, ship Kaku, V0.x.x, kaku release, prepare release, dry-run release, resume release, notarize, homebrew tap, nightly, Nightly 包, 更新 nightly, 预览包"
 ---
 
 # Kaku Release Runbook
 
-`scripts/release.sh` is authoritative. This skill captures the local-machine setup and the order Tang and the agent rely on each release.
+`scripts/release.sh` is authoritative. This skill captures the release prerequisites and the order Tang and the agent rely on each release. Exact credential locations and one-time recovery commands live in the ignored `.claude/release.local.md`, never in this tracked file.
+
+Before any stable or Nightly release, run the non-secret checks under **Verify**. The release dry-run is the authoritative credential gate: it accepts either the rcodesign path or the notarytool fallback, including environment overrides. If it passes, do not load machine-specific recovery context. If a signing identity or every notarization path is missing or stale, then check for and read `.claude/release.local.md`; on Tang's release machine it is the required recovery layer. If the local runbook is absent, stop and ask for it instead of guessing a path or replacing credentials.
 
 ## TL;DR
 
@@ -32,9 +34,9 @@ Rules:
 3. Do not use `--upload-only` unless the existing `dist/Kaku.dmg` is already known to be a signed, notarized, stapled build from the intended commit.
 4. Keep public wording precise: "available in the latest Nightly" only after the check above; otherwise say "fixed on main and will be in the next Nightly or release."
 
-## One-time machine setup
+## Credential prerequisites
 
-Tang's credentials live at `~/save/AppleCertificates/`. The release script checks for either `kaku-asc-api-key-path` (rcodesign route, preferred) or `kaku-notarytool-profile` (notarytool fallback) in the login keychain.
+The ignored `.claude/release.local.md` is the canonical map from Tang's local backup paths to these script inputs. The tracked contract is limited to what the scripts consume: either `KAKU_ASC_API_KEY_PATH` or the `kaku-asc-api-key-path` login-keychain item for rcodesign, and either `KAKU_NOTARYTOOL_PROFILE` or the `kaku-notarytool-profile` login-keychain item for the fallback. Do not delete or rewrite the local recovery map merely because its paths are machine-specific.
 
 ### Preferred: rcodesign + ASC API key
 
@@ -42,30 +44,23 @@ Tang's credentials live at `~/save/AppleCertificates/`. The release script check
 
 ```bash
 cargo install apple-codesign         # binary: rcodesign, lands in ~/.cargo/bin
-security add-generic-password -s 'kaku-asc-api-key-path' -a 'kaku' \
-  -w "$HOME/save/AppleCertificates/asc_api_key.json"
 ```
 
-The JSON already has `issuer_id`, `key_id`, and `private_key` baked in (rcodesign-native format).
+The private JSON supplied through the environment or keychain path must use rcodesign's native `issuer_id`, `key_id`, and `private_key` format. Do not record its location in tracked docs.
 
 ### Fallback: notarytool profile
 
-```bash
-xcrun notarytool store-credentials kaku-notarytool \
-  --apple-id  "$(cat ~/save/AppleCertificates/notary_apple_id.txt)" \
-  --team-id   "$(cat ~/save/AppleCertificates/team_id.txt)"  \
-  --password  "$(cat ~/save/AppleCertificates/notary_password.txt)"
-security add-generic-password -s 'kaku-notarytool-profile' -a 'kaku' -w 'kaku-notarytool'
-```
+Create the notarytool profile with the maintainer's private Apple ID, team ID, and app-specific password outside the repository. Pass its profile name through `KAKU_NOTARYTOOL_PROFILE` or the expected login-keychain item; never paste the source values or the import command into a tracked runbook.
 
 ### Verify
 
 ```bash
-which rcodesign
-security find-generic-password -s 'kaku-asc-api-key-path' -w
 security find-identity -v -p codesigning | grep 'Developer ID Application'
 gh auth status
+./scripts/release.sh --dry-run
 ```
+
+When the dry-run reports a notarization failure, use `command -v rcodesign`, `security find-generic-password -s 'kaku-asc-api-key-path'`, and `security find-generic-password -s 'kaku-notarytool-profile'` as separate diagnostics. They are not an AND gate: one complete notarization backend is sufficient.
 
 ## Pre-release content checklist
 
@@ -133,8 +128,8 @@ Resume flags require the corresponding artifacts in `dist/` to still be present.
 
 - **`Local main is not synchronized with origin/main`**: push the pending commit. `release.sh` requires the tag to point at a commit that exists on origin.
 - **`rcodesign` not found**: `cargo install apple-codesign`, then verify with `which rcodesign`. Do not try `brew install rcodesign`; it is not a core formula.
-- **`No Developer ID Application certificate found`**: re-import `~/save/AppleCertificates/Kaku_DevID.p12` (password in `p12_password.txt`) into the login keychain.
-- **`Notarization credentials not found`**: re-run the keychain commands in the setup section above. The script will otherwise prompt interactively, which fails in non-interactive shells.
+- **`No Developer ID Application certificate found`**: re-import the certificate from the maintainer-approved private backup through Keychain Access, using the password from the private runbook. Never add either location to this file.
+- **`Notarization credentials not found`**: follow the ignored private setup runbook to provision one of the environment/keychain inputs described under Credential prerequisites, then rerun `./scripts/release.sh --dry-run`. The script otherwise prompts interactively, which fails in non-interactive shells.
 - **rcodesign S3 connect timeout (3.1s)**: rcodesign uploads the dmg to `notary-submissions-prod.s3.amazonaws.com` via the AWS SDK for Rust, which has a hardcoded 3.1s connect timeout and does not honor `*_proxy` env vars. On networks where direct connect to AWS S3 is slow or proxied (typical for mainland China), it fails consistently with `s3 upload error: HTTP connect timeout occurred after 3.1s`. The error is independent of credentials. Fix: prefix the run with `KAKU_ASC_API_KEY_PATH=/dev/null` to make `notarize.sh` skip rcodesign and use notarytool directly. Both keychain entries should remain set.
 - **Homebrew tap verifier timed out at 12/12**: usually a Fastly CDN false negative, not a real failure. The tap workflow commits `kakuku <version>` to `tw93/homebrew-tap` main on success; verify with `gh api repos/tw93/homebrew-tap/commits/main --jq .commit.message`. The release script polls via `download_url` (raw.githubusercontent.com) which sits behind Fastly with `cache-control: max-age=300`, so the previous version's content can be served for the full 3-minute polling window. If the tap commit is present, the release is complete; CDN catches up within 1-5 minutes. To suppress the verifier on future runs use `REQUIRE_HOMEBREW_TAP_UPDATE=0`. A proper fix would switch the verifier to read API content (`gh api .../contents/... --jq .content | base64 -d`) instead of `download_url`.
 - **Tag already exists on origin at a different SHA**: do not force-push tags. Pick the next patch number, bump versions, and start over.

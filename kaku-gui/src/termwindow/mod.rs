@@ -33,7 +33,8 @@ use ::window::*;
 use anyhow::{anyhow, ensure, Context};
 use config::keyassignment::{
     Confirmation, KeyAssignment, LauncherActionArgs, PaneDirection, PaneEncoding, Pattern,
-    PromptInputLine, QuickSelectArguments, RotationDirection, SpawnCommand, SplitSize,
+    PromptInputLine, QuickSelectArguments, RotationDirection, ScrollbackEraseMode, SpawnCommand,
+    SplitSize,
 };
 use config::window::WindowLevel;
 use config::{
@@ -92,70 +93,14 @@ pub mod spawn;
 pub mod tab_rename;
 pub mod webgpu;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum InputBroadcastMode {
-    Off,
-    CurrentTab,
-    AllTabs,
-}
-
-impl InputBroadcastMode {
-    fn applies_to_active_tab(
-        self,
-        target_tab_id: Option<TabId>,
-        active_tab_id: Option<TabId>,
-    ) -> bool {
-        match self {
-            Self::Off => false,
-            Self::CurrentTab => target_tab_id.is_some() && target_tab_id == active_tab_id,
-            Self::AllTabs => true,
-        }
-    }
-
-    fn should_broadcast_input(
-        self,
-        target_tab_id: Option<TabId>,
-        active_tab_id: Option<TabId>,
-        is_active_mux_pane: bool,
-        target_count: usize,
-    ) -> bool {
-        is_active_mux_pane
-            && target_count >= 2
-            && self.applies_to_active_tab(target_tab_id, active_tab_id)
-    }
-
-    fn title_prefix(self) -> Option<&'static str> {
-        match self {
-            Self::Off => None,
-            Self::CurrentTab => Some("[Broadcast: Tab]"),
-            Self::AllTabs => Some("[Broadcast: All Tabs]"),
-        }
-    }
-
-    fn disabled_toast(self) -> &'static str {
-        match self {
-            Self::Off => "Broadcast input off",
-            Self::CurrentTab => "Current tab broadcast input off",
-            Self::AllTabs => "All tabs broadcast input off",
-        }
-    }
-
-    fn unavailable_toast(self) -> &'static str {
-        match self {
-            Self::Off => "Broadcast input needs at least 2 panes",
-            Self::CurrentTab => "Current tab broadcast input needs at least 2 panes",
-            Self::AllTabs => "All tabs broadcast input needs at least 2 panes",
-        }
-    }
-
-    fn enabled_toast(self, target_count: usize) -> String {
-        match self {
-            Self::Off => format!("Broadcast input on ({target_count} panes)"),
-            Self::CurrentTab => {
-                format!("Current tab broadcast input on ({target_count} panes)")
-            }
-            Self::AllTabs => format!("All tabs broadcast input on ({target_count} panes)"),
-        }
+fn scrollback_erase_mode_for_pane(
+    requested: ScrollbackEraseMode,
+    alternate_screen_active: bool,
+) -> ScrollbackEraseMode {
+    if requested == ScrollbackEraseMode::ScrollbackAndViewport && alternate_screen_active {
+        ScrollbackEraseMode::ScrollbackOnly
+    } else {
+        requested
     }
 }
 
@@ -1046,9 +991,6 @@ pub struct TermWindow {
     scrollbar: ScrollbarState,
     line_editor_selection: LineEditorSelectionState,
     line_editor_selection_owner: Option<PaneId>,
-    input_broadcast_mode: InputBroadcastMode,
-    input_broadcast_tab_id: Option<TabId>,
-
     tab_state: RefCell<HashMap<TabId, TabState>>,
     pane_state: RefCell<HashMap<PaneId, PaneState>>,
     semantic_zones: HashMap<PaneId, SemanticZoneCache>,
@@ -1730,8 +1672,6 @@ impl TermWindow {
             scrollbar: ScrollbarState::default(),
             line_editor_selection: LineEditorSelectionState::None,
             line_editor_selection_owner: None,
-            input_broadcast_mode: InputBroadcastMode::Off,
-            input_broadcast_tab_id: None,
             tab_state: RefCell::new(HashMap::new()),
             pane_state: RefCell::new(HashMap::new()),
             current_mouse_buttons: vec![],
@@ -3681,12 +3621,6 @@ impl TermWindow {
             }
         };
 
-        let title = match self.input_broadcast_title_prefix() {
-            Some(prefix) if title.is_empty() => prefix.to_string(),
-            Some(prefix) => format!("{prefix} {title}"),
-            None => title,
-        };
-
         if let Some(window) = self.window.as_ref().cloned() {
             if title != self.last_window_title {
                 self.last_window_title = title.clone();
@@ -4479,6 +4413,14 @@ impl TermWindow {
             if modal.perform_assignment(assignment, self) {
                 return Ok(PerformAssignmentResult::Handled);
             }
+            // The modal declined this command. Menu key equivalents still reach
+            // us while a modal is up, because AppKit routes them ahead of
+            // keyDown, and a modal swallows every key event it does get. Leaving
+            // it open would strand any confirmation overlay the command opens,
+            // so the modal gives way to the command.
+            if !matches!(assignment, Nop | DisableDefaultAssignment) {
+                self.cancel_modal();
+            }
         }
 
         match pane.perform_assignment(assignment) {
@@ -4628,12 +4570,6 @@ impl TermWindow {
                 self.activate_tab_relative(*n, false)?;
             }
             ActivateLastTab => self.activate_last_tab()?,
-            ToggleCurrentTabPanesInputBroadcast => {
-                self.toggle_input_broadcast_mode(InputBroadcastMode::CurrentTab)
-            }
-            ToggleAllPanesInputBroadcast => {
-                self.toggle_input_broadcast_mode(InputBroadcastMode::AllTabs)
-            }
             DecreaseFontSize => self.decrease_font_size(),
             IncreaseFontSize => self.increase_font_size(),
             ResetFontSize => self.reset_font_size(),
@@ -4695,7 +4631,10 @@ impl TermWindow {
             RestorePreviousWindow => {
                 crate::session_restore::restore_previous_window_from_menu(Some(self.mux_window_id));
             }
-            Nop | DisableDefaultAssignment => {}
+            Nop
+            | DisableDefaultAssignment
+            | ToggleCurrentTabPanesInputBroadcast
+            | ToggleAllPanesInputBroadcast => {}
             ReloadConfiguration => {
                 config::reload();
                 refresh_fast_config_snapshot();
@@ -4871,7 +4810,10 @@ impl TermWindow {
                 }
             }
             ClearScrollback(erase_mode) => {
-                pane.erase_scrollback(*erase_mode);
+                pane.erase_scrollback(scrollback_erase_mode_for_pane(
+                    *erase_mode,
+                    pane.is_alt_screen_active(),
+                ));
                 let window = self.window.as_ref().unwrap();
                 window.invalidate();
             }
@@ -5625,7 +5567,7 @@ impl TermWindow {
 
         // Last pane in tab: close the tab instead so remove_tab cascades
         // to window removal (fixes Cmd+W in fullscreen with one tab).
-        if tab.count_panes() == Some(1) {
+        if tab.count_panes_blocking() == 1 {
             drop(tab);
             return self.close_current_tab(confirm);
         }
@@ -5788,6 +5730,10 @@ impl TermWindow {
                 promise::spawn::spawn(future).detach();
             }
         } else {
+            // Same bookkeeping as close_current_tab: the close button and the
+            // middle click must feed ReopenLastClosedTab too, or Cmd+Shift+T
+            // silently does nothing for tabs closed with the mouse.
+            self.record_closed_tab_cwd(&tab);
             mux.remove_tab(tab_id);
         }
     }
@@ -5808,10 +5754,9 @@ impl TermWindow {
                 tab.can_close_without_prompting(CloseReason::Tab)
             });
         if should_confirm {
-            // Tab has running processes; ask the user first.
-            // We do not record the cwd here: the user may cancel, and we cannot
-            // reliably hook the async confirmation result from this call site.
-            // In practice, tabs with active processes are rare to close with reopen-intent.
+            // Tab has running processes; ask the user first. The cwd is
+            // recorded from the confirmed branch of confirm_close_tab, which is
+            // the only place that knows the user did not cancel.
             if let Some(window) = self.window.clone() {
                 let (overlay, future) = start_overlay(self, &tab, move |tab_id, term| {
                     confirm_close_tab(tab_id, term, mux_window_id, window)
@@ -5826,7 +5771,7 @@ impl TermWindow {
         }
     }
 
-    fn record_closed_tab_cwd(&mut self, tab: &Arc<Tab>) {
+    pub(crate) fn record_closed_tab_cwd(&mut self, tab: &Arc<Tab>) {
         if let Some(pane) = tab.get_active_pane() {
             if let Some(cwd) = pane
                 .get_current_working_dir(mux::pane::CachePolicy::AllowStale)
@@ -6110,223 +6055,16 @@ impl TermWindow {
         tab.get_active_pane()
     }
 
-    fn active_tab_id(&self) -> Option<TabId> {
-        let mux = Mux::get();
-        mux.get_active_tab_for_window(self.mux_window_id)
-            .map(|tab| tab.tab_id())
-    }
-
-    fn input_broadcast_target_tab_id(&self) -> Option<TabId> {
-        if self.input_broadcast_mode != InputBroadcastMode::CurrentTab {
-            return None;
-        }
-
-        let target_tab_id = self.input_broadcast_tab_id?;
-        let mux = Mux::get();
-        let _tab = mux.get_tab(target_tab_id)?;
-        (mux.window_containing_tab(target_tab_id) == Some(self.mux_window_id))
-            .then_some(target_tab_id)
-    }
-
-    fn input_broadcast_title_prefix(&self) -> Option<&'static str> {
-        if self.input_broadcast_target_count(self.input_broadcast_mode) >= 2
-            && self
-                .input_broadcast_mode
-                .applies_to_active_tab(self.input_broadcast_target_tab_id(), self.active_tab_id())
-        {
-            self.input_broadcast_mode.title_prefix()
-        } else {
-            None
-        }
-    }
-
-    fn input_broadcast_target_count_for_tab(&self, tab_id: TabId) -> usize {
-        let mux = Mux::get();
-        let Some(tab) = mux.get_tab(tab_id) else {
-            return 0;
-        };
-
-        let mut pane_ids = std::collections::HashSet::new();
-        for pos in tab.iter_panes() {
-            pane_ids.insert(pos.pane.pane_id());
-        }
-        pane_ids.len()
-    }
-
-    fn input_broadcast_target_count(&self, mode: InputBroadcastMode) -> usize {
-        let mux = Mux::get();
-        let mut pane_ids = std::collections::HashSet::new();
-
-        match mode {
-            InputBroadcastMode::Off => 0,
-            InputBroadcastMode::CurrentTab => {
-                let Some(tab_id) = self.input_broadcast_target_tab_id() else {
-                    return 0;
-                };
-                self.input_broadcast_target_count_for_tab(tab_id)
-            }
-            InputBroadcastMode::AllTabs => {
-                let Some(window) = mux.get_window(self.mux_window_id) else {
-                    return 0;
-                };
-
-                for tab in window.iter() {
-                    for pos in tab.iter_panes() {
-                        pane_ids.insert(pos.pane.pane_id());
-                    }
-                }
-                pane_ids.len()
-            }
-        }
-    }
-
-    fn broadcast_input_visual_mode(&self) -> bool {
-        if !self
-            .input_broadcast_mode
-            .applies_to_active_tab(self.input_broadcast_target_tab_id(), self.active_tab_id())
-            || self.input_broadcast_target_count(self.input_broadcast_mode) < 2
-        {
-            return false;
-        }
-
-        match (
-            self.get_active_pane_or_overlay(),
-            self.get_active_pane_no_overlay(),
-        ) {
-            (Some(active_or_overlay), Some(active_pane)) => {
-                Arc::ptr_eq(&active_or_overlay, &active_pane)
-            }
-            _ => false,
-        }
-    }
-
-    fn is_active_mux_pane(&self, pane: &Arc<dyn Pane>) -> bool {
-        self.get_active_pane_no_overlay()
-            .as_ref()
-            .is_some_and(|active_pane| Arc::ptr_eq(active_pane, pane))
-    }
-
-    fn terminal_input_targets(&self, pane: &Arc<dyn Pane>) -> Vec<Arc<dyn Pane>> {
-        let target_tab_id = self.input_broadcast_target_tab_id();
-        let active_tab_id = self.active_tab_id();
-        let target_count = self.input_broadcast_target_count(self.input_broadcast_mode);
-        if !self.input_broadcast_mode.should_broadcast_input(
-            target_tab_id,
-            active_tab_id,
-            self.is_active_mux_pane(pane),
-            target_count,
-        ) {
-            return vec![pane.clone()];
-        }
-
-        let mut result = vec![pane.clone()];
-
-        let mux = Mux::get();
-        match self.input_broadcast_mode {
-            InputBroadcastMode::Off => {}
-            InputBroadcastMode::CurrentTab => {
-                let Some(target_tab_id) = self.input_broadcast_target_tab_id() else {
-                    return vec![pane.clone()];
-                };
-                if self.active_tab_id() != Some(target_tab_id) {
-                    return vec![pane.clone()];
-                }
-                let Some(tab) = mux.get_tab(target_tab_id) else {
-                    return vec![pane.clone()];
-                };
-
-                for pos in tab.iter_panes() {
-                    let tab_pane = pos.pane;
-                    if result
-                        .iter()
-                        .any(|existing| existing.pane_id() == tab_pane.pane_id())
-                    {
-                        continue;
-                    }
-                    result.push(tab_pane);
-                }
-            }
-            InputBroadcastMode::AllTabs => {
-                let Some(window) = mux.get_window(self.mux_window_id) else {
-                    return vec![pane.clone()];
-                };
-
-                for tab in window.iter() {
-                    for pos in tab.iter_panes() {
-                        let tab_pane = pos.pane;
-                        if result
-                            .iter()
-                            .any(|existing| existing.pane_id() == tab_pane.pane_id())
-                        {
-                            continue;
-                        }
-                        result.push(tab_pane);
-                    }
-                }
-            }
-        }
-
-        if result.len() > 1 {
+    fn write_terminal_input_bytes(&self, pane: &Arc<dyn Pane>, bytes: &[u8]) -> anyhow::Result<()> {
+        let result = pane
+            .writer()
+            .write_all(bytes)
+            .context("sending terminal input bytes");
+        if bytes.is_empty() {
             result
         } else {
-            vec![pane.clone()]
+            self.finish_terminal_input(pane, result)
         }
-    }
-
-    fn for_each_terminal_input_target<F>(
-        &self,
-        pane: &Arc<dyn Pane>,
-        mut func: F,
-    ) -> anyhow::Result<()>
-    where
-        F: FnMut(&Arc<dyn Pane>) -> anyhow::Result<()>,
-    {
-        let targets = self.terminal_input_targets(pane);
-        let mut primary_error = None;
-        let mut fallback_error = None;
-        let mut any_success = false;
-
-        for (idx, target) in targets.iter().enumerate() {
-            match func(target) {
-                Ok(()) => any_success = true,
-                Err(err) => {
-                    if idx == 0 {
-                        primary_error = Some(err);
-                    } else {
-                        log::warn!(
-                            "broadcast terminal input to pane {} failed: {err:#}",
-                            target.pane_id()
-                        );
-                        fallback_error.get_or_insert(err);
-                    }
-                }
-            }
-        }
-
-        if let Some(err) = primary_error {
-            return Err(err);
-        }
-        if any_success {
-            return Ok(());
-        }
-        if let Some(err) = fallback_error {
-            return Err(err);
-        }
-        Ok(())
-    }
-
-    fn write_terminal_input_bytes(&self, pane: &Arc<dyn Pane>, bytes: &[u8]) -> anyhow::Result<()> {
-        self.for_each_terminal_input_target(pane, |target| {
-            let result = target
-                .writer()
-                .write_all(bytes)
-                .context("sending terminal input bytes");
-            if bytes.is_empty() {
-                result
-            } else {
-                self.finish_terminal_input(target, result)
-            }
-        })
     }
 
     fn send_terminal_input_key(
@@ -6337,83 +6075,24 @@ impl TermWindow {
         is_down: bool,
         key_event: Option<&KeyEvent>,
     ) -> anyhow::Result<()> {
-        self.for_each_terminal_input_target(pane, |target| {
-            let encoded = key_event.and_then(|event| {
-                self.encode_win32_input(target, event)
-                    .or_else(|| self.encode_kitty_input(target, event))
-            });
-            let result = if let Some(encoded) = encoded {
-                target
-                    .writer()
-                    .write_all(encoded.as_bytes())
-                    .context("sending encoded terminal input")
-            } else if is_down {
-                target.key_down(key.clone(), modifiers)
-            } else {
-                target.key_up(key.clone(), modifiers)
-            };
+        let encoded = key_event.and_then(|event| {
+            self.encode_win32_input(pane, event)
+                .or_else(|| self.encode_kitty_input(pane, event))
+        });
+        let result = if let Some(encoded) = encoded {
+            pane.writer()
+                .write_all(encoded.as_bytes())
+                .context("sending encoded terminal input")
+        } else if is_down {
+            pane.key_down(key.clone(), modifiers)
+        } else {
+            pane.key_up(key.clone(), modifiers)
+        };
 
-            if is_down && !key.is_modifier() {
-                self.finish_terminal_input(target, result)
-            } else {
-                result
-            }
-        })
-    }
-
-    fn toggle_input_broadcast_mode(&mut self, mode: InputBroadcastMode) {
-        match mode {
-            InputBroadcastMode::Off => {
-                self.input_broadcast_mode = InputBroadcastMode::Off;
-                self.input_broadcast_tab_id = None;
-                self.update_title();
-                self.show_toast(mode.disabled_toast().to_string());
-            }
-            InputBroadcastMode::CurrentTab => {
-                let target_tab_id = self.active_tab_id();
-                if self.input_broadcast_mode == InputBroadcastMode::CurrentTab
-                    && self.input_broadcast_tab_id == target_tab_id
-                {
-                    self.input_broadcast_mode = InputBroadcastMode::Off;
-                    self.input_broadcast_tab_id = None;
-                    self.update_title();
-                    self.show_toast(mode.disabled_toast().to_string());
-                    return;
-                }
-
-                let target_count = target_tab_id
-                    .map(|tab_id| self.input_broadcast_target_count_for_tab(tab_id))
-                    .unwrap_or(0);
-                if target_count < 2 {
-                    self.show_toast(mode.unavailable_toast().to_string());
-                    return;
-                }
-
-                self.input_broadcast_mode = InputBroadcastMode::CurrentTab;
-                self.input_broadcast_tab_id = target_tab_id;
-                self.update_title();
-                self.show_toast(mode.enabled_toast(target_count));
-            }
-            InputBroadcastMode::AllTabs => {
-                if self.input_broadcast_mode == InputBroadcastMode::AllTabs {
-                    self.input_broadcast_mode = InputBroadcastMode::Off;
-                    self.input_broadcast_tab_id = None;
-                    self.update_title();
-                    self.show_toast(mode.disabled_toast().to_string());
-                    return;
-                }
-
-                let target_count = self.input_broadcast_target_count(mode);
-                if target_count < 2 {
-                    self.show_toast(mode.unavailable_toast().to_string());
-                    return;
-                }
-
-                self.input_broadcast_mode = InputBroadcastMode::AllTabs;
-                self.input_broadcast_tab_id = None;
-                self.update_title();
-                self.show_toast(mode.enabled_toast(target_count));
-            }
+        if is_down && !key.is_modifier() {
+            self.finish_terminal_input(pane, result)
+        } else {
+            result
         }
     }
 
@@ -6675,11 +6354,11 @@ impl Drop for TermWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        bell_notification_message, FileLinkTarget, InputBroadcastMode, MouseCapture,
+        bell_notification_message, scrollback_erase_mode_for_pane, FileLinkTarget, MouseCapture,
         RenderableDimensions, TermWindow,
     };
+    use config::keyassignment::ScrollbackEraseMode;
     use mux::pane::PaneId;
-    use mux::tab::TabId;
     use std::path::PathBuf;
     use wezterm_term::StableRowIndex;
 
@@ -6689,6 +6368,22 @@ mod tests {
             "SOME_OTHER_USER_VAR",
             true
         ));
+    }
+
+    #[test]
+    fn clear_scrollback_keeps_alternate_screen_viewport_intact() {
+        assert_eq!(
+            scrollback_erase_mode_for_pane(ScrollbackEraseMode::ScrollbackAndViewport, true),
+            ScrollbackEraseMode::ScrollbackOnly,
+        );
+    }
+
+    #[test]
+    fn clear_scrollback_still_clears_normal_screen_viewport() {
+        assert_eq!(
+            scrollback_erase_mode_for_pane(ScrollbackEraseMode::ScrollbackAndViewport, false),
+            ScrollbackEraseMode::ScrollbackAndViewport,
+        );
     }
 
     #[test]
@@ -6756,41 +6451,6 @@ mod tests {
             col: Some(3),
         };
         assert_eq!(TermWindow::file_link_location(&target), "/tmp/demo.rs");
-    }
-
-    #[test]
-    fn current_tab_broadcast_only_applies_to_bound_tab() {
-        let tab_a = TabId::from(1usize);
-        let tab_b = TabId::from(2usize);
-
-        assert!(InputBroadcastMode::CurrentTab.applies_to_active_tab(Some(tab_a), Some(tab_a)));
-        assert!(!InputBroadcastMode::CurrentTab.applies_to_active_tab(Some(tab_a), Some(tab_b)));
-        assert!(!InputBroadcastMode::CurrentTab.applies_to_active_tab(None, Some(tab_a)));
-        assert!(InputBroadcastMode::AllTabs.applies_to_active_tab(Some(tab_a), Some(tab_b)));
-        assert!(!InputBroadcastMode::Off.applies_to_active_tab(Some(tab_a), Some(tab_a)));
-    }
-
-    #[test]
-    fn broadcast_input_requires_explicit_mode_active_pane_and_multiple_targets() {
-        let tab_a = TabId::from(1usize);
-        let tab_b = TabId::from(2usize);
-
-        assert!(!InputBroadcastMode::Off.should_broadcast_input(Some(tab_a), Some(tab_a), true, 2));
-        assert!(!InputBroadcastMode::AllTabs.should_broadcast_input(None, Some(tab_a), false, 2));
-        assert!(!InputBroadcastMode::AllTabs.should_broadcast_input(None, Some(tab_a), true, 1));
-        assert!(InputBroadcastMode::AllTabs.should_broadcast_input(None, Some(tab_a), true, 2));
-        assert!(!InputBroadcastMode::CurrentTab.should_broadcast_input(
-            Some(tab_a),
-            Some(tab_b),
-            true,
-            2
-        ));
-        assert!(InputBroadcastMode::CurrentTab.should_broadcast_input(
-            Some(tab_a),
-            Some(tab_a),
-            true,
-            2
-        ));
     }
 
     fn dims(physical_top: StableRowIndex, scrollback_top: StableRowIndex) -> RenderableDimensions {
