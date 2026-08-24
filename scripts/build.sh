@@ -365,7 +365,30 @@ if [[ "$APP_ONLY" == "1" ]]; then
 	exit 0
 fi
 
-UPDATE_ZIP_NAME="kaku_for_update.zip"
+# Arch-specific artifact naming: universal keeps legacy name for compatibility
+case "$BUILD_ARCH" in
+arm64)
+	DMG_SUFFIX="-arm64"
+	ZIP_SUFFIX="-arm64"
+	;;
+x86_64)
+	DMG_SUFFIX="-x64"
+	ZIP_SUFFIX="-x64"
+	;;
+native)
+	case "$(uname -m)" in
+	arm64 | aarch64) DMG_SUFFIX="-arm64" ;;
+	x86_64) DMG_SUFFIX="-x64" ;;
+	*) DMG_SUFFIX="" ;;
+	esac
+	ZIP_SUFFIX="$DMG_SUFFIX"
+	;;
+universal | *)
+	DMG_SUFFIX=""
+	ZIP_SUFFIX=""
+	;;
+esac
+UPDATE_ZIP_NAME="kaku_for_update${ZIP_SUFFIX}.zip"
 UPDATE_ZIP_PATH="$OUT_DIR/$UPDATE_ZIP_NAME"
 UPDATE_SHA_PATH="$OUT_DIR/${UPDATE_ZIP_NAME}.sha256"
 
@@ -380,11 +403,11 @@ echo "Update archive created: $UPDATE_ZIP_PATH"
 echo "Update checksum created: $UPDATE_SHA_PATH"
 
 echo "[7/7] Creating DMG..."
-DMG_NAME="$APP_NAME.dmg"
+DMG_NAME="$APP_NAME${DMG_SUFFIX}.dmg"
 DMG_PATH="$OUT_DIR/$DMG_NAME"
-DMG_BASE_PATH="$OUT_DIR/$APP_NAME"
-TEMP_DMG_PATH="$OUT_DIR/${APP_NAME}-temp.dmg"
-STAGING_DIR="$OUT_DIR/dmg_staging"
+DMG_BASE_PATH="$OUT_DIR/$APP_NAME${DMG_SUFFIX}"
+TEMP_DMG_PATH="$OUT_DIR/${APP_NAME}${DMG_SUFFIX}-temp.dmg"
+STAGING_DIR="$OUT_DIR/dmg_staging${DMG_SUFFIX}"
 BACKGROUND_IMAGE_SOURCE="assets/macos/dmg/background.png"
 BACKGROUND_IMAGE_NAME="background.png"
 

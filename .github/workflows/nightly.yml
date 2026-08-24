@@ -41,15 +41,40 @@ jobs:
           set -o pipefail
           ./scripts/build.sh 2>&1 | sed '/has no symbols/d'
 
+      - name: Build ARM64 DMG
+        env:
+          PROFILE: release-opt
+          BUILD_ARCH: arm64
+          OUT_DIR: dist
+        run: |
+          set -o pipefail
+          ./scripts/build.sh 2>&1 | sed '/has no symbols/d'
+
+      - name: Build x64 DMG
+        env:
+          PROFILE: release-opt
+          BUILD_ARCH: x86_64
+          OUT_DIR: dist
+        run: |
+          set -o pipefail
+          ./scripts/build.sh 2>&1 | sed '/has no symbols/d'
+
       - name: Prepare Nightly Assets & Checksums
         run: |
           cd dist
           cp -f Kaku.dmg Kaku-nightly.dmg
+          cp -f Kaku-arm64.dmg Kaku-nightly-arm64.dmg 2>/dev/null || true
+          cp -f Kaku-x64.dmg Kaku-nightly-x64.dmg 2>/dev/null || true
           shasum -a 256 Kaku-nightly.dmg > Kaku-nightly.dmg.sha256
-          shasum -a 256 kaku_for_update.zip > kaku_for_update.zip.sha256
-          shasum -a 256 Kaku-nightly.dmg kaku_for_update.zip > sha256sums.txt
+          shasum -a 256 Kaku-nightly-arm64.dmg > Kaku-nightly-arm64.dmg.sha256 2>/dev/null || true
+          shasum -a 256 Kaku-nightly-x64.dmg > Kaku-nightly-x64.dmg.sha256 2>/dev/null || true
+          shasum -a 256 kaku_for_update.zip > kaku_for_update.zip.sha256 || true
+          shasum -a 256 kaku_for_update-arm64.zip > kaku_for_update-arm64.zip.sha256 2>/dev/null || true
+          shasum -a 256 kaku_for_update-x64.zip > kaku_for_update-x64.zip.sha256 2>/dev/null || true
+          cat *.sha256 > sha256sums.txt 2>/dev/null || true
           echo "Nightly Checksums:"
           cat sha256sums.txt
+          ls -lh dist/*.dmg dist/*.zip 2>/dev/null || true
 
       - name: Prepare Nightly Release Notes
         id: notes
@@ -73,7 +98,11 @@ jobs:
           | File | Description | Checksum |
           |---|---|---|
           | \`Kaku-nightly.dmg\` | macOS Universal Preview Disk Image | \`Kaku-nightly.dmg.sha256\` |
-          | \`kaku_for_update.zip\` | In-app Auto Update Archive | \`kaku_for_update.zip.sha256\` |
+          | \`Kaku-nightly-arm64.dmg\` | macOS Apple Silicon Preview Disk Image | \`Kaku-nightly-arm64.dmg.sha256\` |
+          | \`Kaku-nightly-x64.dmg\` | macOS Intel Preview Disk Image | \`Kaku-nightly-x64.dmg.sha256\` |
+          | \`kaku_for_update.zip\` | In-app Auto Update Archive (Universal) | \`kaku_for_update.zip.sha256\` |
+          | \`kaku_for_update-arm64.zip\` | In-app Auto Update Archive (ARM64) | \`kaku_for_update-arm64.zip.sha256\` |
+          | \`kaku_for_update-x64.zip\` | In-app Auto Update Archive (x64) | \`kaku_for_update-x64.zip.sha256\` |
 
           ### Recent Commits
 
@@ -99,9 +128,17 @@ jobs:
           draft: false
           files: |
             dist/Kaku-nightly.dmg
+            dist/Kaku-nightly-arm64.dmg
+            dist/Kaku-nightly-x64.dmg
             dist/kaku_for_update.zip
+            dist/kaku_for_update-arm64.zip
+            dist/kaku_for_update-x64.zip
             dist/Kaku-nightly.dmg.sha256
+            dist/Kaku-nightly-arm64.dmg.sha256
+            dist/Kaku-nightly-x64.dmg.sha256
             dist/kaku_for_update.zip.sha256
+            dist/kaku_for_update-arm64.zip.sha256
+            dist/kaku_for_update-x64.zip.sha256
             dist/sha256sums.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

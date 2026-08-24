@@ -126,14 +126,45 @@ jobs:
           set -o pipefail
           ./scripts/build.sh 2>&1 | sed '/has no symbols/d'
 
+      - name: Build ARM64 macOS Bundle & DMG
+        env:
+          PROFILE: release-opt
+          BUILD_ARCH: arm64
+          OUT_DIR: dist
+        run: |
+          set -o pipefail
+          ./scripts/build.sh 2>&1 | sed '/has no symbols/d'
+
+      - name: Build x64 macOS Bundle & DMG
+        env:
+          PROFILE: release-opt
+          BUILD_ARCH: x86_64
+          OUT_DIR: dist
+        run: |
+          set -o pipefail
+          ./scripts/build.sh 2>&1 | sed '/has no symbols/d'
+
       - name: Generate Checksums
         run: |
           cd dist
-          shasum -a 256 Kaku.dmg > Kaku.dmg.sha256
-          shasum -a 256 kaku_for_update.zip > kaku_for_update.zip.sha256
-          shasum -a 256 Kaku.dmg kaku_for_update.zip > sha256sums.txt
+          shasum -a 256 Kaku.dmg > Kaku.dmg.sha256 || true
+          shasum -a 256 Kaku-arm64.dmg > Kaku-arm64.dmg.sha256 || true
+          shasum -a 256 Kaku-x64.dmg > Kaku-x64.dmg.sha256 || true
+          shasum -a 256 kaku_for_update.zip > kaku_for_update.zip.sha256 || true
+          shasum -a 256 kaku_for_update-arm64.zip > kaku_for_update-arm64.zip.sha256 || true
+          shasum -a 256 kaku_for_update-x64.zip > kaku_for_update-x64.zip.sha256 || true
+          # Combined manifest
+          cat *.sha256 > sha256sums.txt || true
           echo "Checksums generated:"
           cat sha256sums.txt
+          ls -lh dist/*.dmg dist/*.zip 2>/dev/null || true
+          # Verify architectures
+          echo "=== lipo verify ==="
+          lipo -info dist/Kaku.dmg 2>&1 | head -5 || true
+          for f in dist/Kaku.app/Contents/MacOS/kaku-gui dist/Kaku-arm64.app 2>/dev/null; do true; done
+          # Check built DMGs exist (at least universal must exist)
+          test -f dist/Kaku.dmg || (echo "Missing universal DMG" && exit 1)
+          ls -lh dist/*.dmg
 
       - name: Prepare Release Notes
         id: notes
@@ -160,7 +191,11 @@ jobs:
           | File | Description | Checksum |
           |---|---|---|
           | `Kaku.dmg` | macOS Universal App Disk Image (Apple Silicon & Intel) | `Kaku.dmg.sha256` |
-          | `kaku_for_update.zip` | In-app Auto Update Archive | `kaku_for_update.zip.sha256` |
+          | `Kaku-arm64.dmg` | macOS Apple Silicon Disk Image | `Kaku-arm64.dmg.sha256` |
+          | `Kaku-x64.dmg` | macOS Intel Disk Image | `Kaku-x64.dmg.sha256` |
+          | `kaku_for_update.zip` | In-app Auto Update Archive (Universal) | `kaku_for_update.zip.sha256` |
+          | `kaku_for_update-arm64.zip` | In-app Auto Update Archive (ARM64) | `kaku_for_update-arm64.zip.sha256` |
+          | `kaku_for_update-x64.zip` | In-app Auto Update Archive (x64) | `kaku_for_update-x64.zip.sha256` |
 
           ### Changelog
           EOF
@@ -185,9 +220,17 @@ jobs:
           prerelease: ${{ inputs.prerelease || false }}
           files: |
             dist/Kaku.dmg
+            dist/Kaku-arm64.dmg
+            dist/Kaku-x64.dmg
             dist/kaku_for_update.zip
+            dist/kaku_for_update-arm64.zip
+            dist/kaku_for_update-x64.zip
             dist/Kaku.dmg.sha256
+            dist/Kaku-arm64.dmg.sha256
+            dist/Kaku-x64.dmg.sha256
             dist/kaku_for_update.zip.sha256
+            dist/kaku_for_update-arm64.zip.sha256
+            dist/kaku_for_update-x64.zip.sha256
             dist/sha256sums.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

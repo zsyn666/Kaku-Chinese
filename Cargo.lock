@@ -2921,7 +2921,7 @@ dependencies = [
 
 [[package]]
 name = "kaku"
-version = "0.18.0"
+version = "0.18.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -2972,7 +2972,7 @@ version = "0.1.0"
 
 [[package]]
 name = "kaku-gui"
-version = "0.18.0"
+version = "0.18.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",

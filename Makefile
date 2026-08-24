@@ -1,4 +1,4 @@
-.PHONY: all fmt fmt-check build app dev check test install-tools install-hooks test-webgpu-fallback release dmg nightly
+.PHONY: all fmt fmt-check build app app-native app-arm64 app-x64 dev check test install-tools install-hooks test-webgpu-fallback release dmg dmg-universal dmg-arm64 dmg-x64 nightly
 
 all: build
 
@@ -17,7 +17,16 @@ check:
 	./scripts/check_prompts.sh
 
 app:
-	PROFILE=debug ./scripts/build.sh --app-only 2>&1 | grep -v "ranlib: warning:.*has no symbols"; exit $${PIPESTATUS[0]}
+	BUILD_ARCH=universal PROFILE=debug ./scripts/build.sh --app-only 2>&1 | grep -v "ranlib: warning:.*has no symbols"; exit $${PIPESTATUS[0]}
+
+app-native:
+	./scripts/build.sh --native-arch --app-only 2>&1 | grep -v "ranlib: warning:.*has no symbols"; exit $${PIPESTATUS[0]}
+
+app-arm64:
+	BUILD_ARCH=arm64 PROFILE=debug ./scripts/build.sh --app-only 2>&1 | grep -v "ranlib: warning:.*has no symbols"; exit $${PIPESTATUS[0]}
+
+app-x64:
+	BUILD_ARCH=x86_64 PROFILE=debug ./scripts/build.sh --app-only 2>&1 | grep -v "ranlib: warning:.*has no symbols"; exit $${PIPESTATUS[0]}
 
 dev:
 	@if ! command -v cargo-watch >/dev/null 2>&1; then \
@@ -75,6 +84,15 @@ test-webgpu-fallback:
 
 dmg:
 	./scripts/build.sh && ./scripts/notarize.sh
+
+dmg-universal:
+	BUILD_ARCH=universal ./scripts/build.sh && ./scripts/notarize.sh
+
+dmg-arm64:
+	BUILD_ARCH=arm64 ./scripts/build.sh && ./scripts/notarize.sh
+
+dmg-x64:
+	BUILD_ARCH=x86_64 ./scripts/build.sh && ./scripts/notarize.sh
 
 nightly:
 	./scripts/nightly.sh

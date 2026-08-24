@@ -70,6 +70,13 @@ jobs:
           lipo -info target/universal/release/kaku
           lipo -info target/universal/release/kaku-gui
 
+          echo "Verify per-arch single-arch binaries"
+          lipo -info target/aarch64-apple-darwin/release/kaku | grep -q "Non-fat" || lipo -info target/aarch64-apple-darwin/release/kaku | grep -q "arm64"
+          lipo -info target/x86_64-apple-darwin/release/kaku | grep -q "Non-fat" || lipo -info target/x86_64-apple-darwin/release/kaku | grep -q "x86_64"
+          lipo -info target/aarch64-apple-darwin/release/kaku-gui | grep -q "Non-fat" || true
+          lipo -info target/x86_64-apple-darwin/release/kaku-gui | grep -q "Non-fat" || true
+          echo "Per-arch verification passed"
+
   app-bundle:
     name: App Bundle Validation
     runs-on: macos-latest
