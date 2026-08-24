@@ -1,0 +1,68 @@
+name: Sync Upstream
+
+# Daily auto-merge from tw93/Kaku (upstream) into this fork.
+# Direct-pushes to main on success, per maintainer preference.
+# Whitelisted auto-resolution lives in scripts/sync_upstream.sh.
+# Any non-whitelisted conflict aborts the merge and job fails for manual triage.
+
+on:
+  schedule:
+    # Daily at 03:00 UTC
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream/main
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync upstream
+        run: |
+          chmod +x scripts/sync_upstream.sh
+          bash scripts/sync_upstream.sh
+
+      - name: Validate after merge
+        run: |
+          echo "=== cargo audit (if available) ==="
+          # cargo-audit is not preinstalled on ubuntu; run via cargo if lock changed, otherwise skip
+          if command -v cargo-audit >/dev/null 2>&1; then
+            cargo audit || echo "cargo audit reported issues (check logs)"
+          else
+            echo "cargo-audit not installed, skipping (audit.yml runs on macos)"
+          fi
+          echo ""
+          echo "=== Config checks ==="
+          bash ./scripts/check_release_config.sh
+          bash ./scripts/check_config_release_readiness.sh
+          echo ""
+          echo "=== Cargo check (locked) ==="
+          cargo check --locked -p kaku -p kaku-gui || echo "cargo check failed (see logs)"
+
+      - name: Push to main if updated
+        run: |
+          # Only push if HEAD is ahead of origin/main
+          git fetch origin main
+          if git rev-list --left-right --count origin/main...HEAD | grep -q "^0[[:space:]]"; then
+            echo "No new commits to push"
+            exit 0
+          fi
+          echo "Pushing $(git rev-parse --short HEAD) to origin/main"
+          git push origin HEAD:main

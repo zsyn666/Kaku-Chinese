@@ -1,0 +1,11 @@
+# Fork sync helpers
+# Cargo.lock and config_version are auto-resolved by scripts/sync_upstream.sh
+# instead of git's built-in text merge, to avoid semantic corruption
+# (e.g. h2 downgrade, windows-sys churn). Keep them as binary so a
+# textual conflict always surfaces and the script can apply the precise
+# patch (h2 0.4.13->0.4.16, config_version max+1, etc.).
+Cargo.lock merge=binary
+assets/shell-integration/config_version.txt merge=binary
+assets/shell-integration/config_update_highlights.tsv merge=binary
+docs/config-versions.md merge=binary
+.github/workflows/audit.yml merge=binary
