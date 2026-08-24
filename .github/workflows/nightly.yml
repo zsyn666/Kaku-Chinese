@@ -90,7 +90,7 @@ jobs:
           echo "notes_path=$NOTES_FILE" >> "$GITHUB_OUTPUT"
 
       - name: Publish Nightly Release
-        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87238604da99376a6cb63 # v2.2.1
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
         with:
           tag_name: nightly
           name: Nightly Preview (${{ steps.notes.outputs.date || github.sha }})

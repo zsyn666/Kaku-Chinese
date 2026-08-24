@@ -176,7 +176,7 @@ jobs:
           echo "notes_path=$NOTES_FILE" >> "$GITHUB_OUTPUT"
 
       - name: Create or Update GitHub Release
-        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87238604da99376a6cb63 # v2.2.1
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
         with:
           tag_name: ${{ steps.vars.outputs.tag }}
           name: Kaku ${{ steps.vars.outputs.tag }}
