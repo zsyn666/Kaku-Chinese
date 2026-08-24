@@ -78,3 +78,5 @@
 32	命令面板或 Window 菜单可以把当前标签页连同分屏整个移到新窗口
 32	Dragging a window between displays no longer leaves its title bar stuck behind the menu bar
 32	跨显示器拖动窗口时，标题栏不会再卡在菜单栏后面
+33	Security Audit maintenance: update h2 to 0.4.16 for RUSTSEC-2026-0258 and trust Homebrew tap
+33	安全审计维护：更新 h2 至 0.4.16 修复 RUSTSEC-2026-0258 并信任 Homebrew tap
