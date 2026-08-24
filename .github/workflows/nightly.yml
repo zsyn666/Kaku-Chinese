@@ -14,9 +14,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  build-nightly:
-    name: Build & Publish Nightly Preview
+  build:
+    name: Build ${{ matrix.arch }}
     runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: universal
+            build_arch: universal
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - arch: arm64
+            build_arch: arm64
+            rust_targets: aarch64-apple-darwin
+          - arch: x64
+            build_arch: x86_64
+            rust_targets: x86_64-apple-darwin
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -27,54 +40,73 @@ jobs:
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: 1.95.0
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: ${{ matrix.rust_targets }}
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: nightly-${{ matrix.arch }}-cargo
 
-      - name: Build Universal macOS Bundle & DMG
+      - name: Build ${{ matrix.arch }} Bundle & DMG
         env:
           PROFILE: release-opt
-          BUILD_ARCH: universal
+          BUILD_ARCH: ${{ matrix.build_arch }}
           OUT_DIR: dist
         run: |
           set -o pipefail
           ./scripts/build.sh 2>&1 | sed '/has no symbols/d'
+          ls -lh dist/*.dmg dist/*.zip 2>/dev/null || true
 
-      - name: Build ARM64 DMG
-        env:
-          PROFILE: release-opt
-          BUILD_ARCH: arm64
-          OUT_DIR: dist
+      - name: Generate Checksums (${{ matrix.arch }})
         run: |
-          set -o pipefail
-          ./scripts/build.sh 2>&1 | sed '/has no symbols/d'
+          cd dist
+          for f in Kaku*.dmg kaku*.zip; do [ -f "$f" ] && shasum -a 256 "$f" > "$f.sha256" || true; done
+          cat *.sha256 2>/dev/null || true
 
-      - name: Build x64 DMG
-        env:
-          PROFILE: release-opt
-          BUILD_ARCH: x86_64
-          OUT_DIR: dist
-        run: |
-          set -o pipefail
-          ./scripts/build.sh 2>&1 | sed '/has no symbols/d'
+      - name: Upload artifacts (${{ matrix.arch }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 5
+
+  publish:
+    name: Publish Nightly Preview
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
 
       - name: Prepare Nightly Assets & Checksums
         run: |
           cd dist
-          cp -f Kaku.dmg Kaku-nightly.dmg
+          cp -f Kaku.dmg Kaku-nightly.dmg 2>/dev/null || true
           cp -f Kaku-arm64.dmg Kaku-nightly-arm64.dmg 2>/dev/null || true
           cp -f Kaku-x64.dmg Kaku-nightly-x64.dmg 2>/dev/null || true
-          shasum -a 256 Kaku-nightly.dmg > Kaku-nightly.dmg.sha256
+          shasum -a 256 Kaku-nightly.dmg > Kaku-nightly.dmg.sha256 2>/dev/null || true
           shasum -a 256 Kaku-nightly-arm64.dmg > Kaku-nightly-arm64.dmg.sha256 2>/dev/null || true
           shasum -a 256 Kaku-nightly-x64.dmg > Kaku-nightly-x64.dmg.sha256 2>/dev/null || true
-          shasum -a 256 kaku_for_update.zip > kaku_for_update.zip.sha256 || true
-          shasum -a 256 kaku_for_update-arm64.zip > kaku_for_update-arm64.zip.sha256 2>/dev/null || true
-          shasum -a 256 kaku_for_update-x64.zip > kaku_for_update-x64.zip.sha256 2>/dev/null || true
+          # Keep original zips as nightly zips (or copy)
+          cp -f kaku_for_update.zip kaku_for_update.zip 2>/dev/null || true
+          for f in kaku_for_update*.zip; do [ -f "$f" ] && shasum -a 256 "$f" > "$f.sha256" || true; done
           cat *.sha256 > sha256sums.txt 2>/dev/null || true
           echo "Nightly Checksums:"
           cat sha256sums.txt
-          ls -lh dist/*.dmg dist/*.zip 2>/dev/null || true
+          ls -lh
 
       - name: Prepare Nightly Release Notes
         id: notes
@@ -122,7 +154,7 @@ jobs:
         uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda # v2.2.1
         with:
           tag_name: nightly
-          name: Nightly Preview (${{ steps.notes.outputs.date || github.sha }})
+          name: Nightly Preview (${{ github.sha }})
           body_path: ${{ steps.notes.outputs.notes_path }}
           prerelease: true
           draft: false

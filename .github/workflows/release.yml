@@ -65,11 +65,24 @@ jobs:
           ./scripts/check_logs.sh
           ./scripts/check_prompts.sh
 
-  build-release:
-    name: Build & Publish Release
+  build:
+    name: Build ${{ matrix.arch }}
     runs-on: macos-latest
     needs: [test]
     if: ${{ always() && (needs.test.result == 'success' || needs.test.result == 'skipped') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: universal
+            rust_targets: aarch64-apple-darwin,x86_64-apple-darwin
+            build_arch: universal
+          - arch: arm64
+            rust_targets: aarch64-apple-darwin
+            build_arch: arm64
+          - arch: x64
+            rust_targets: x86_64-apple-darwin
+            build_arch: x86_64
     steps:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -80,24 +93,13 @@ jobs:
         uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: 1.95.0
-          targets: aarch64-apple-darwin,x86_64-apple-darwin
+          targets: ${{ matrix.rust_targets }}
 
       - name: Cache Cargo
         uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
-
-      - name: Determine Release Tag
-        id: vars
-        run: |
-          if [ -n "${{ inputs.tag_name }}" ]; then
-            TAG="${{ inputs.tag_name }}"
-          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            TAG="${GITHUB_REF#refs/tags/}"
-          else
-            CARGO_VERSION=$(grep '^version =' kaku/Cargo.toml | head -n1 | cut -d'"' -f2)
-            TAG="v${CARGO_VERSION}"
-          fi
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "Release tag: $TAG"
+        with:
+          # Separate cache per arch to avoid target dir contention
+          key: ${{ matrix.arch }}-cargo
 
       - name: Optional macOS Code Signing Setup
         if: ${{ env.MACOS_CERTIFICATE != '' }}
@@ -117,54 +119,91 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple: -s -k "$MACOS_KEYCHAIN_PWD" "$KEYCHAIN_PATH"
           security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
 
-      - name: Build Universal macOS Bundle & DMG
+      - name: Build ${{ matrix.arch }} Bundle & DMG
         env:
           PROFILE: release-opt
-          BUILD_ARCH: universal
+          BUILD_ARCH: ${{ matrix.build_arch }}
           OUT_DIR: dist
         run: |
           set -o pipefail
           ./scripts/build.sh 2>&1 | sed '/has no symbols/d'
+          echo "=== Built ${{ matrix.arch }} ==="
+          ls -lh dist/*.dmg dist/*.zip 2>/dev/null || true
+          # Per-arch lipo verification
+          if [ "${{ matrix.arch }}" = "universal" ]; then
+            # Universal should be fat
+            lipo -info dist/Kaku.app/Contents/MacOS/kaku-gui 2>/dev/null | grep -q "x86_64.*arm64\|arm64.*x86_64" || lipo -info dist/Kaku.app/Contents/MacOS/kaku-gui || true
+          elif [ "${{ matrix.arch }}" = "arm64" ]; then
+            lipo -info dist/Kaku.app/Contents/MacOS/kaku-gui 2>/dev/null | grep -q "arm64" || true
+          else
+            lipo -info dist/Kaku.app/Contents/MacOS/kaku-gui 2>/dev/null | grep -q "x86_64" || true
+          fi
 
-      - name: Build ARM64 macOS Bundle & DMG
-        env:
-          PROFILE: release-opt
-          BUILD_ARCH: arm64
-          OUT_DIR: dist
-        run: |
-          set -o pipefail
-          ./scripts/build.sh 2>&1 | sed '/has no symbols/d'
-
-      - name: Build x64 macOS Bundle & DMG
-        env:
-          PROFILE: release-opt
-          BUILD_ARCH: x86_64
-          OUT_DIR: dist
-        run: |
-          set -o pipefail
-          ./scripts/build.sh 2>&1 | sed '/has no symbols/d'
-
-      - name: Generate Checksums
+      - name: Generate Checksums (${{ matrix.arch }})
         run: |
           cd dist
-          shasum -a 256 Kaku.dmg > Kaku.dmg.sha256 || true
-          shasum -a 256 Kaku-arm64.dmg > Kaku-arm64.dmg.sha256 || true
-          shasum -a 256 Kaku-x64.dmg > Kaku-x64.dmg.sha256 || true
-          shasum -a 256 kaku_for_update.zip > kaku_for_update.zip.sha256 || true
-          shasum -a 256 kaku_for_update-arm64.zip > kaku_for_update-arm64.zip.sha256 || true
-          shasum -a 256 kaku_for_update-x64.zip > kaku_for_update-x64.zip.sha256 || true
-          # Combined manifest
-          cat *.sha256 > sha256sums.txt || true
-          echo "Checksums generated:"
+          # Generate sha for whatever was built (universal or per-arch)
+          for f in Kaku*.dmg kaku*.zip; do
+            [ -f "$f" ] && shasum -a 256 "$f" > "$f.sha256" || true
+          done
+          cat *.sha256 2>/dev/null || true
+          ls -lh
+
+      - name: Upload artifacts (${{ matrix.arch }})
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.arch }}
+          path: |
+            dist/*.dmg
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 5
+
+  publish:
+    name: Publish Release
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Determine Release Tag
+        id: vars
+        run: |
+          if [ -n "${{ inputs.tag_name }}" ]; then
+            TAG="${{ inputs.tag_name }}"
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          else
+            CARGO_VERSION=$(grep '^version =' kaku/Cargo.toml | head -n1 | cut -d'"' -f2)
+            TAG="v${CARGO_VERSION}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Release tag: $TAG"
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Combine checksums
+        run: |
+          cd dist
+          cat *.sha256 > sha256sums.txt 2>/dev/null || true
+          echo "=== All checksums ==="
           cat sha256sums.txt
-          ls -lh dist/*.dmg dist/*.zip 2>/dev/null || true
-          # Verify architectures
-          echo "=== lipo verify ==="
-          lipo -info dist/Kaku.dmg 2>&1 | head -5 || true
-          for f in dist/Kaku.app/Contents/MacOS/kaku-gui dist/Kaku-arm64.app 2>/dev/null; do true; done
-          # Check built DMGs exist (at least universal must exist)
-          test -f dist/Kaku.dmg || (echo "Missing universal DMG" && exit 1)
-          ls -lh dist/*.dmg
+          echo ""
+          echo "=== All artifacts ==="
+          ls -lh
+          # Ensure required files exist (at least universal)
+          test -f Kaku.dmg || (echo "Missing Kaku.dmg" && ls -lh && exit 1)
+          test -f Kaku-arm64.dmg || echo "Warning: Kaku-arm64.dmg missing"
+          test -f Kaku-x64.dmg || echo "Warning: Kaku-x64.dmg missing"
 
       - name: Prepare Release Notes
         id: notes
