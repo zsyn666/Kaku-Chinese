@@ -31,6 +31,17 @@ jobs:
       - name: Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
 
+      - name: Prepare Homebrew tap trust
+        run: |
+          # GitHub's macOS images ship with aws/tap pre-tapped but Homebrew
+          # now requires explicit trust (https://docs.brew.sh/Tap-Trust).
+          # Without this, every `brew` invocation emits a warning annotation
+          # ("The following taps are not trusted: aws/tap") that pollutes the
+          # Security Audit workflow. Trust it if present.
+          if brew tap | grep -q '^aws/tap'; then
+            brew trust aws/tap || true
+          fi
+
       - name: Install cargo-audit
         run: brew install cargo-audit
 
