@@ -211,9 +211,16 @@ import sys
 
 ours, theirs, output = (pathlib.Path(value) for value in sys.argv[1:])
 upstream_lines = theirs.read_text(encoding="utf-8").splitlines()
+upstream_versions = {
+    line.split("|", 2)[1].strip()
+    for line in upstream_lines
+    if line.startswith("| v") and "|" in line[1:]
+}
 local_rows = [
     line for line in ours.read_text(encoding="utf-8").splitlines()
-    if line.startswith("| v") and line not in upstream_lines
+    if line.startswith("| v")
+    and line not in upstream_lines
+    and line.split("|", 2)[1].strip() not in upstream_versions
 ]
 if local_rows:
     insert_at = next(
