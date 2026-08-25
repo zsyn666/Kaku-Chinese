@@ -520,7 +520,7 @@ fn download_and_stage_update(
 
     // 2. Verify SHA256
     log::info!("staged update: verifying checksum...");
-    let checksum_text = curl_get_text(sha_url, proxy)?;
+    let checksum_text = curl_get_text(&sha_url, proxy)?;
     verify_sha256(&zip_path, &checksum_text)?;
 
     // 3. Extract
@@ -988,22 +988,26 @@ mod tests {
         );
 
         // Download zip
-        let zip_url = find_asset(&release.assets, UPDATE_ZIP_NAME)
-            .map(|a| a.browser_download_url.as_str())
-            .unwrap_or(LATEST_ZIP_URL);
-        let zip_path = staged.join(UPDATE_ZIP_NAME);
+        let arch_zip = arch_update_zip_name();
+        let arch_sha = arch_update_sha_name();
+        let zip_url = find_asset(&release.assets, &arch_zip)
+            .or_else(|| find_asset(&release.assets, UPDATE_ZIP_NAME))
+            .map(|a| a.browser_download_url.clone())
+            .unwrap_or_else(latest_zip_url);
+        let zip_path = staged.join(&arch_zip);
         println!("downloading from: {}", zip_url);
-        curl_download_to_file(zip_url, &zip_path, &proxy).expect("download zip");
+        curl_download_to_file(&zip_url, &zip_path, &proxy).expect("download zip");
         assert!(zip_path.exists(), "zip should exist after download");
         let zip_size = fs::metadata(&zip_path).unwrap().len();
         println!("downloaded zip size: {} bytes", zip_size);
         assert!(zip_size > 1_000_000, "zip should be at least 1MB");
 
         // Verify SHA256
-        let sha_url = find_asset(&release.assets, UPDATE_SHA_NAME)
-            .map(|a| a.browser_download_url.as_str())
-            .unwrap_or(LATEST_SHA_URL);
-        let checksum_text = curl_get_text(sha_url, &proxy).expect("fetch checksum");
+        let sha_url = find_asset(&release.assets, &arch_sha)
+            .or_else(|| find_asset(&release.assets, UPDATE_SHA_NAME))
+            .map(|a| a.browser_download_url.clone())
+            .unwrap_or_else(latest_sha_url);
+        let checksum_text = curl_get_text(&sha_url, &proxy).expect("fetch checksum");
         println!("checksum: {}", checksum_text.trim());
         verify_sha256(&zip_path, &checksum_text).expect("sha256 verification");
         println!("SHA256 verified OK");
