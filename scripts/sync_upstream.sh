@@ -6,27 +6,22 @@ cd "$REPO_ROOT"
 
 echo "=== Sync upstream tw93/Kaku -> Kaku-Chinese ==="
 
-# Ensure git identity for auto-commits
-git config user.name "github-actions[bot]" >/dev/null 2>&1 || true
-git config user.email "41898282+github-actions[bot]@users.noreply.github.com" >/dev/null 2>&1 || true
+git config user.name "github-actions[bot]"
+git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-# Ensure upstream remote
 if ! git remote get-url upstream >/dev/null 2>&1; then
   echo "Adding upstream remote tw93/Kaku"
   git remote add upstream https://github.com/tw93/Kaku.git
 fi
 
-# Fetch upstream main (prune to keep clean)
 echo "Fetching upstream/main..."
 git fetch upstream main --prune
 
-# Already up-to-date?
 if git merge-base --is-ancestor upstream/main HEAD; then
   echo "Already up to date with upstream/main, nothing to do."
   exit 0
 fi
 
-# Show divergence
 echo "Local HEAD: $(git rev-parse --short HEAD)"
 echo "Upstream : $(git rev-parse --short upstream/main)"
 echo "Merge-base: $(git rev-parse --short "$(git merge-base HEAD upstream/main)")"
@@ -34,384 +29,411 @@ echo ""
 echo "Commits in upstream not in local:"
 git log --oneline HEAD..upstream/main | head -20 || true
 echo ""
-echo "Commits in local not in upstream:"
-git log --oneline upstream/main..HEAD | head -20 || true
-echo ""
 
-# Attempt merge
-echo "Attempting git merge --no-ff upstream/main..."
-set +e
-git merge --no-ff --no-edit upstream/main
-MERGE_STATUS=$?
-set -e
+is_conflicted() {
+  git diff --name-only --diff-filter=U | grep -Fxq -- "$1"
+}
 
-resolve_cargo_lock() {
-  echo "Resolving Cargo.lock..."
-  # Prefer upstream's Cargo.lock, then re-apply h2 fix if needed
-  if git diff --name-only --diff-filter=U | grep -q "^Cargo.lock$"; then
-    git checkout --theirs -- Cargo.lock || true
-    git add Cargo.lock
-    echo "  took theirs for Cargo.lock, now ensuring h2 >=0.4.16"
-    python3 - "$REPO_ROOT/Cargo.lock" <<'PY'
-import pathlib, re, sys
-p = pathlib.Path(sys.argv[1])
-text = p.read_text(encoding='utf-8')
-# Check h2 version
-m = re.search(r'name = "h2"\nversion = "([^"]+)"\n[^\n]*\nchecksum = "([^"]+)"', text)
-if m:
-    ver = m.group(1)
-    print(f"  h2 version in merged Cargo.lock: {ver}")
-    if ver != "0.4.16":
-        # Only bump h2 block to 0.4.16, keep other dependencies as upstream resolved
-        old = 'name = "h2"\nversion = "0.4.13"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"'
-        new = 'name = "h2"\nversion = "0.4.16"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"'
-        if old in text:
-            text = text.replace(old, new)
-            p.write_text(text, encoding='utf-8')
-            print("  patched h2 0.4.13 -> 0.4.16")
-        else:
-            print("  h2 block not in expected 0.4.13 form, leaving as is")
+resolve_release_metadata() {
+  # Release notes and the contributor image are upstream-owned/generated files.
+  for file in .github/RELEASE_NOTES.md CONTRIBUTORS.svg; do
+    if is_conflicted "$file"; then
+      echo "Taking upstream version of $file"
+      git checkout --theirs -- "$file"
+      git add "$file"
+    fi
+  done
+}
+
+resolve_manifest() {
+  local file="$1"
+  if ! is_conflicted "$file"; then
+    return 0
+  fi
+
+  echo "Resolving fork manifest $file..."
+  local base ours theirs merged
+  base=$(mktemp)
+  ours=$(mktemp)
+  theirs=$(mktemp)
+  merged=$(mktemp)
+  git show :1:"$file" >"$base"
+  git show :2:"$file" >"$ours"
+  git show :3:"$file" >"$theirs"
+
+  # Merge non-conflicting upstream changes, but keep fork-specific changes in
+  # conflict regions (especially rust-i18n). The package version is selected
+  # separately as the newer of the two versions.
+  set +e
+  git merge-file -p "$ours" "$base" "$theirs" >"$merged"
+  local merge_file_status=$?
+  set -e
+  python3 - "$merged" "$ours" "$theirs" "$file" <<'PY'
+import pathlib
+import re
+import sys
+
+merged_path, ours_path, theirs_path, output_path = sys.argv[1:]
+merged = pathlib.Path(merged_path).read_text(encoding="utf-8")
+ours = pathlib.Path(ours_path).read_text(encoding="utf-8")
+theirs = pathlib.Path(theirs_path).read_text(encoding="utf-8")
+
+# Prefer the fork only inside conflict markers. This leaves all clean upstream
+# edits in place instead of replacing the complete manifest with either side.
+lines = merged.splitlines()
+result = []
+i = 0
+while i < len(lines):
+    if lines[i].startswith("<<<<<<<"):
+        i += 1
+        fork_lines = []
+        while i < len(lines) and not lines[i].startswith("======="):
+            fork_lines.append(lines[i])
+            i += 1
+        while i < len(lines) and not lines[i].startswith(">>>>>>>"):
+            i += 1
+        if i < len(lines):
+            i += 1
+        result.extend(fork_lines)
     else:
-        print("  h2 already >=0.4.16, keep upstream")
-else:
-    print("  h2 package not found")
+        result.append(lines[i])
+        i += 1
+
+text = "\n".join(result) + "\n"
+
+def package_version(value):
+    match = re.search(
+        r'^\[package\]\s*\nname = "[^"]+"\s*\nversion = "([^"]+)"',
+        value,
+        re.MULTILINE,
+    )
+    return match.group(1) if match else None
+
+def version_key(value):
+    try:
+        return tuple(int(part) for part in value.split(".")[:3])
+    except (AttributeError, ValueError):
+        return (0, 0, 0)
+
+fork_version = package_version(ours)
+upstream_version = package_version(theirs)
+if upstream_version and (not fork_version or version_key(upstream_version) > version_key(fork_version)):
+    text = re.sub(
+        r'(^\[package\]\s*\nname = "[^"]+"\s*\nversion = )"[^"]+"',
+        rf'\g<1>"{upstream_version}"',
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+
+pathlib.Path(output_path).write_text(text, encoding="utf-8")
 PY
-    git add Cargo.lock
-  else
-    echo "  Cargo.lock not conflicted, checking h2 version anyway"
-    # Even if no conflict, ensure h2 is not regressed to vulnerable version
-    python3 - "$REPO_ROOT/Cargo.lock" <<'PY'
-import pathlib, re, sys
-p = pathlib.Path(sys.argv[1])
-text = p.read_text(encoding='utf-8')
-if 'version = "0.4.13"' in text and 'name = "h2"' in text:
-    old = 'name = "h2"\nversion = "0.4.13"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"'
-    new = 'name = "h2"\nversion = "0.4.16"\nsource = "registry+https://github.com/rust-lang/crates.io-index"\nchecksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"'
-    if old in text:
-        text = text.replace(old, new)
-        p.write_text(text, encoding='utf-8')
-        print("  patched h2 0.4.13 -> 0.4.16 (no-conflict path)")
-PY
-    git add Cargo.lock || true
+  git add "$file"
+  rm -f "$base" "$ours" "$theirs" "$merged"
+  if [ "$merge_file_status" -gt 1 ]; then
+    echo "Unable to merge $file" >&2
+    return 1
   fi
 }
 
-resolve_config_version() {
-  echo "Resolving config_version files..."
-  # If any of the three files is conflicted, unify them
-  local conflicted=false
-  for f in assets/shell-integration/config_version.txt assets/shell-integration/config_update_highlights.tsv docs/config-versions.md; do
-    if git diff --name-only --diff-filter=U | grep -q "^${f}$"; then
-      conflicted=true
-    fi
-  done
-  # Also need to handle case where merge succeeded but current < min (gate would fail)
-  # Compute current, theirs, ours, and required minimum
-  local ours_version theirs_version current_version
-  # ours is HEAD before merge (saved via git show HEAD:... but HEAD now is merge commit with conflicts)
-  # Use :2: and :3: stages if conflicted, otherwise use file
-  if git diff --name-only --diff-filter=U | grep -q "config_version.txt"; then
-    ours_version=$(git show :2:assets/shell-integration/config_version.txt 2>/dev/null | tr -d '[:space:]' || echo "0")
-    theirs_version=$(git show :3:assets/shell-integration/config_version.txt 2>/dev/null | tr -d '[:space:]' || echo "0")
-    echo "  conflict: ours=$ours_version theirs=$theirs_version"
-    # Compute new version as max + 1 to guarantee > previous tag
-    local max=$ours_version
-    if [ "$theirs_version" -gt "$max" ]; then max=$theirs_version; fi
-    # Also consider previous tag's version +1
-    local prev_tag prev_version min_version
-    prev_tag=$(git tag --sort=-version:refname | grep -E '^[Vv][0-9]+\.[0-9]+\.[0-9]+$' | grep -Eiv "^v$(grep '^version =' "$REPO_ROOT/kaku/Cargo.toml" | head -n1 | cut -d'"' -f2)$" | head -n1 || true)
-    if [ -n "$prev_tag" ]; then
-      prev_version=$(git show "${prev_tag}:assets/shell-integration/config_version.txt" 2>/dev/null | tr -d '[:space:]' || echo "0")
-      if [[ "$prev_version" =~ ^[0-9]+$ ]]; then
-        min_version=$((prev_version + 1))
-        echo "  previous tag $prev_tag has $prev_version, min required $min_version"
-        if [ "$min_version" -gt "$max" ]; then max=$((min_version - 1)); fi
-      fi
-    fi
-    local new_version=$((max + 1))
-    # If upstream already satisfied min and ours==theirs, we still need +1 per gate
-    # Use max+1 unconditionally when conflict
-    echo "  bumping config_version to $new_version"
-    echo "$new_version" > assets/shell-integration/config_version.txt
-    git add assets/shell-integration/config_version.txt
-    # Now fix highlights and docs for new_version
-    resolve_highlights "$new_version"
-    resolve_docs "$new_version"
-  else
-    # No conflict on config_version.txt, but check if current still satisfies gate
-    current_version=$(cat assets/shell-integration/config_version.txt | tr -d '[:space:]')
-    local prev_tag prev_version min_version
-    prev_tag=$(git tag --sort=-version:refname | grep -E '^[Vv][0-9]+\.[0-9]+\.[0-9]+$' | grep -Eiv "^v$(grep '^version =' "$REPO_ROOT/kaku/Cargo.toml" | head -n1 | cut -d'"' -f2)$" | head -n1 || true)
-    if [ -n "$prev_tag" ]; then
-      prev_version=$(git show "${prev_tag}:assets/shell-integration/config_version.txt" 2>/dev/null | tr -d '[:space:]' || echo "0")
-      if [[ "$prev_version" =~ ^[0-9]+$ ]]; then
-        min_version=$((prev_version + 1))
-        if [ "$current_version" -lt "$min_version" ]; then
-          echo "  current $current_version < min $min_version (previous $prev_tag=$prev_version), bumping to $min_version"
-          echo "$min_version" > assets/shell-integration/config_version.txt
-          git add assets/shell-integration/config_version.txt
-          resolve_highlights "$min_version"
-          resolve_docs "$min_version"
-        else
-          echo "  current $current_version satisfies min $min_version"
-        fi
-      fi
-    fi
-    # Also ensure highlights/docs not left conflicted
-    for f in assets/shell-integration/config_update_highlights.tsv docs/config-versions.md; do
-      if git diff --name-only --diff-filter=U | grep -q "^${f}$"; then
-        echo "  $f still conflicted, taking union"
-        if [ "$f" = "assets/shell-integration/config_update_highlights.tsv" ]; then
-          # Take theirs and re-append our new version entries if missing
-          git checkout --theirs -- "$f" || true
-          # Ensure new_version highlights exist
-          local cv=$(cat assets/shell-integration/config_version.txt | tr -d '[:space:]')
-          if ! grep -q "^${cv}	" "$f"; then
-            resolve_highlights "$cv"
-          else
-            git add "$f"
-          fi
-        else
-          git checkout --theirs -- "$f" || true
-          local cv=$(cat assets/shell-integration/config_version.txt | tr -d '[:space:]')
-          if ! grep -q "v${cv}" "$f"; then
-            resolve_docs "$cv"
-          else
-            git add "$f"
-          fi
-        fi
-      fi
-    done
+resolve_cargo_lock() {
+  local file="Cargo.lock"
+  if is_conflicted "$file"; then
+    echo "Taking upstream Cargo.lock, then checking h2..."
+    git checkout --theirs -- "$file"
+    git add "$file"
   fi
+
+  # Keep the RustSec fix if upstream ever regresses to the vulnerable version.
+  python3 - "$REPO_ROOT/$file" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+old = '''name = "h2"
+version = "0.4.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f44da3a8150a6703ed5d34e164b875fd14c2cdab9af1252a9a1020bde2bdc54"'''
+new = '''name = "h2"
+version = "0.4.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a9f37a958b41b3b19ee2707c06439c0e9e547e847223eb791ecb0cb821c65e27"'''
+if old in text:
+    path.write_text(text.replace(old, new), encoding="utf-8")
+    print("  patched h2 0.4.13 -> 0.4.16")
+PY
+  git add "$file"
+}
+
+resolve_highlights_conflict() {
+  local file="assets/shell-integration/config_update_highlights.tsv"
+  if ! is_conflicted "$file"; then
+    return 0
+  fi
+  echo "Merging config highlights from fork and upstream..."
+  local ours theirs
+  ours=$(mktemp)
+  theirs=$(mktemp)
+  git show :2:"$file" >"$ours"
+  git show :3:"$file" >"$theirs"
+  python3 - "$ours" "$theirs" "$file" <<'PY'
+import pathlib
+import sys
+
+ours, theirs, output = (pathlib.Path(value) for value in sys.argv[1:])
+lines = ours.read_text(encoding="utf-8").splitlines()
+seen = set(lines)
+for line in theirs.read_text(encoding="utf-8").splitlines():
+    if line not in seen:
+        lines.append(line)
+        seen.add(line)
+output.write_text("\n".join(lines) + "\n", encoding="utf-8")
+PY
+  git add "$file"
+  rm -f "$ours" "$theirs"
+}
+
+resolve_config_docs_conflict() {
+  local file="docs/config-versions.md"
+  if ! is_conflicted "$file"; then
+    return 0
+  fi
+  echo "Merging config version history from fork and upstream..."
+  local ours theirs
+  ours=$(mktemp)
+  theirs=$(mktemp)
+  git show :2:"$file" >"$ours"
+  git show :3:"$file" >"$theirs"
+  python3 - "$ours" "$theirs" "$file" <<'PY'
+import pathlib
+import sys
+
+ours, theirs, output = (pathlib.Path(value) for value in sys.argv[1:])
+upstream_lines = theirs.read_text(encoding="utf-8").splitlines()
+local_rows = [
+    line for line in ours.read_text(encoding="utf-8").splitlines()
+    if line.startswith("| v") and line not in upstream_lines
+]
+if local_rows:
+    insert_at = next(
+        (index for index, line in enumerate(upstream_lines) if line.startswith("When you bump")),
+        len(upstream_lines),
+    )
+    upstream_lines[insert_at:insert_at] = local_rows
+output.write_text("\n".join(upstream_lines) + "\n", encoding="utf-8")
+PY
+  git add "$file"
+  rm -f "$ours" "$theirs"
 }
 
 resolve_highlights() {
-  local ver=$1
+  local version="$1"
   local file="assets/shell-integration/config_update_highlights.tsv"
-  echo "  ensuring highlights for v$ver"
-  if grep -q "^${ver}	" "$file"; then
-    echo "    already exists for $ver"
+  if grep -q "^${version}[[:space:]]" "$file"; then
     return 0
   fi
-  # If file is still conflicted, take theirs first
-  if git diff --name-only --diff-filter=U | grep -q "^${file}$"; then
-    git checkout --theirs -- "$file" || true
-  fi
-  # Append auto-generated highlights (EN + ZH)
-  printf "%s\tSecurity Audit maintenance: update h2 to 0.4.16 for RUSTSEC-2026-0258 and trust Homebrew tap\n" "$ver" >> "$file"
-  printf "%s\t安全审计维护：更新 h2 至 0.4.16 修复 RUSTSEC-2026-0258 并信任 Homebrew tap\n" "$ver" >> "$file"
-  # Deduplicate and keep sorted? Keep file as is, just ensure at least 2
+  echo "Adding automatic config highlights for version $version"
+  printf '%s\tSecurity Audit maintenance: update h2 to 0.4.16 and preserve cross-architecture release support\n' "$version" >>"$file"
+  printf '%s\t安全审计维护：更新 h2 至 0.4.16 并保持双架构发布支持\n' "$version" >>"$file"
   git add "$file"
-  echo "    added auto highlights for $ver"
 }
 
 resolve_docs() {
-  local ver=$1
+  local version="$1"
   local file="docs/config-versions.md"
-  echo "  ensuring docs for v$ver"
-  if grep -q "v${ver} " "$file"; then
-    echo "    already documented for $ver"
+  if grep -q "| v${version} " "$file"; then
     return 0
   fi
-  if git diff --name-only --diff-filter=U | grep -q "^${file}$"; then
-    git checkout --theirs -- "$file" || true
-  fi
-  # Insert before final line
-  # Find line with "When you bump"
-  local tmp=$(mktemp)
-  awk -v ver="$ver" '
-    /When you bump/ {
-      print "| v" ver " | - | No schema change. Bumps to satisfy the release gate after the Security Audit fixes (h2 0.4.13 -> 0.4.16 for RUSTSEC-2026-0258 and Homebrew `aws\/tap` trust). |"
+  echo "Adding config version history row for v$version"
+  local temp
+  temp=$(mktemp)
+  awk -v version="$version" '
+    /^When you bump/ {
+      print "| v" version " | - | No schema change. Bumps to satisfy the release gate after automatic upstream synchronization. |"
       print ""
     }
-    {print}
-  ' "$file" > "$tmp" && mv "$tmp" "$file"
+    { print }
+  ' "$file" >"$temp"
+  mv "$temp" "$file"
   git add "$file"
-  echo "    added docs row for $ver"
 }
 
-resolve_audit_yml() {
-  echo "Resolving .github/workflows/audit.yml..."
-  if git diff --name-only --diff-filter=U | grep -q "^\.github/workflows/audit.yml$"; then
-    # Take theirs (upstream) and re-inject our Prepare Homebrew tap trust step if missing
-    git checkout --theirs -- .github/workflows/audit.yml || true
-    if ! grep -q "Prepare Homebrew tap trust" .github/workflows/audit.yml; then
-      echo "  re-injecting Prepare Homebrew tap trust step"
-      python3 - <<'PY'
-import pathlib
-p = pathlib.Path(".github/workflows/audit.yml")
-t = p.read_text(encoding='utf-8')
-old = "      - name: Install cargo-audit"
-new = """      - name: Prepare Homebrew tap trust
-        run: |
-          # GitHub's macOS images ship with aws/tap pre-tapped but Homebrew
-          # now requires explicit trust (https://docs.brew.sh/Tap-Trust).
-          # Without this, every `brew` invocation emits a warning annotation
-          # ("The following taps are not trusted: aws/tap") that pollutes the
-          # Security Audit workflow. Trust it if present.
-          if brew tap | grep -q '^aws/tap'; then
-            brew trust aws/tap || true
-          fi
-
-      - name: Install cargo-audit"""
-if old in t and "Prepare Homebrew tap trust" not in t:
-    t = t.replace(old, new)
-    p.write_text(t, encoding='utf-8')
-    print("  injected")
-PY
+resolve_config_version() {
+  echo "Resolving config version files..."
+  local current_version ours_version theirs_version
+  if is_conflicted "assets/shell-integration/config_version.txt"; then
+    ours_version=$(git show :2:assets/shell-integration/config_version.txt | tr -d '[:space:]')
+    theirs_version=$(git show :3:assets/shell-integration/config_version.txt | tr -d '[:space:]')
+    if [[ ! "$ours_version" =~ ^[0-9]+$ || ! "$theirs_version" =~ ^[0-9]+$ ]]; then
+      echo "Invalid config version in merge stages" >&2
+      return 1
     fi
-    git add .github/workflows/audit.yml
+    current_version="$ours_version"
+    if [ "$theirs_version" -gt "$current_version" ]; then
+      current_version="$theirs_version"
+    fi
+    printf '%s\n' "$current_version" >assets/shell-integration/config_version.txt
+    git add assets/shell-integration/config_version.txt
   else
-    echo "  no conflict"
-    # Ensure our step still present even if no conflict but upstream overwrote
-    if ! grep -q "Prepare Homebrew tap trust" .github/workflows/audit.yml; then
-      echo "  step missing after merge (no conflict), injecting"
-      python3 - <<'PY'
-import pathlib
-p = pathlib.Path(".github/workflows/audit.yml")
-t = p.read_text(encoding='utf-8')
-old = "      - name: Install cargo-audit"
-new = """      - name: Prepare Homebrew tap trust
-        run: |
-          # GitHub's macOS images ship with aws/tap pre-tapped but Homebrew
-          # now requires explicit trust (https://docs.brew.sh/Tap-Trust).
-          # Without this, every `brew` invocation emits a warning annotation
-          # ("The following taps are not trusted: aws/tap") that pollutes the
-          # Security Audit workflow. Trust it if present.
-          if brew tap | grep -q '^aws/tap'; then
-            brew trust aws/tap || true
-          fi
+    current_version=$(tr -d '[:space:]' <assets/shell-integration/config_version.txt)
+  fi
 
-      - name: Install cargo-audit"""
-if old in t:
-    t = t.replace(old, new)
-    p.write_text(t, encoding='utf-8')
-PY
-      git add .github/workflows/audit.yml || true
+  if [[ ! "$current_version" =~ ^[0-9]+$ ]]; then
+    echo "Invalid current config version: $current_version" >&2
+    return 1
+  fi
+
+  local release_version previous_tag previous_version minimum_version
+  release_version=$(grep '^version =' "$REPO_ROOT/kaku/Cargo.toml" | head -n1 | cut -d'"' -f2)
+  previous_tag=$(git tag --sort=-version:refname \
+    | grep -E '^[Vv][0-9]+\.[0-9]+\.[0-9]+$' \
+    | grep -Eiv "^v${release_version}$" \
+    | head -n1 || true)
+  if [ -n "$previous_tag" ]; then
+    previous_version=$(git show "${previous_tag}:assets/shell-integration/config_version.txt" 2>/dev/null | tr -d '[:space:]' || true)
+    if [[ "$previous_version" =~ ^[0-9]+$ ]]; then
+      minimum_version=$((previous_version + 1))
+      if [ "$current_version" -lt "$minimum_version" ]; then
+        current_version="$minimum_version"
+        printf '%s\n' "$current_version" >assets/shell-integration/config_version.txt
+        git add assets/shell-integration/config_version.txt
+        echo "  bumped config_version to $current_version (previous $previous_tag=$previous_version)"
+      fi
     fi
   fi
+
+  resolve_highlights_conflict
+  resolve_config_docs_conflict
+  resolve_highlights "$current_version"
+  resolve_docs "$current_version"
+}
+
+ensure_audit_step() {
+  local file=".github/workflows/audit.yml"
+  if is_conflicted "$file"; then
+    git checkout --theirs -- "$file"
+    git add "$file"
+  fi
+  if grep -q "Prepare Homebrew tap trust" "$file"; then
+    return 0
+  fi
+  echo "Preserving Homebrew tap trust step in $file"
+  python3 - "$file" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+text = path.read_text(encoding="utf-8")
+needle = "      - name: Install cargo-audit"
+step = '''      - name: Prepare Homebrew tap trust
+        run: |
+          # macos-latest may ship with aws/tap pre-tapped but untrusted.
+          if brew tap | grep -q '^aws/tap'; then
+            brew trust aws/tap || true
+          fi
+
+'''
+if needle in text:
+    path.write_text(text.replace(needle, step + needle, 1), encoding="utf-8")
+PY
+  git add "$file"
 }
 
 resolve_locales() {
-  echo "Resolving locales..."
-  local conflicted=$(git diff --name-only --diff-filter=U | grep "^locales/" || true)
-  if [ -z "$conflicted" ]; then
-    echo "  no locale conflicts"
-    return 0
-  fi
-  echo "  conflicted locales: $conflicted"
-  for f in $conflicted; do
-    echo "  merging $f via union (theirs + ours)"
-    # Use python to union YAML keys (simple text union for this repo's flat structure)
-    # Strategy: take theirs as base, then append any keys from ours not in theirs
-    # For this i18n bundle, structure is simple; we do 3-way text merge via git merge-file
-    local base=$(mktemp) ours=$(mktemp) theirs=$(mktemp)
-    git show :1:"$f" > "$base" 2>/dev/null || echo "" > "$base"
-    git show :2:"$f" > "$ours" 2>/dev/null || cat "$f" > "$ours" 2>/dev/null || true
-    git show :3:"$f" > "$theirs" 2>/dev/null || echo "" > "$theirs"
-    # Try git merge-file (3-way)
-    cp "$ours" "$f"
-    if git merge-file "$f" "$base" "$theirs"; then
-      echo "    merge-file succeeded for $f"
-      git add "$f"
+  local file base ours theirs merged merge_status
+  while read -r file; do
+    [ -n "$file" ] || continue
+    echo "Resolving locale file $file while preserving fork translations..."
+    base=$(mktemp)
+    ours=$(mktemp)
+    theirs=$(mktemp)
+    merged=$(mktemp)
+    git show :1:"$file" >"$base" 2>/dev/null || : >"$base"
+    git show :2:"$file" >"$ours" 2>/dev/null || : >"$ours"
+    git show :3:"$file" >"$theirs" 2>/dev/null || : >"$theirs"
+    if [ ! -s "$ours" ]; then
+      git checkout --theirs -- "$file"
+      git add "$file"
     else
-      echo "    merge-file had conflicts for $f, taking union"
-      # Fallback: union of lines, prefer ours on duplicate keys
-      python3 - "$base" "$ours" "$theirs" "$f" <<'PY'
-import sys, pathlib
-base, ours, theirs, out = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-def load(p):
-    try: return pathlib.Path(p).read_text(encoding='utf-8').splitlines()
-    except: return []
-b = load(base)
-o = load(ours)
-t = load(theirs)
-# Simple union: keep all lines from theirs, append ours lines not in theirs (by stripped)
-seen = set(l.strip() for l in t)
-merged = t[:]
-for l in o:
-    if l.strip() and l.strip() not in seen and l.strip() not in set(x.strip() for x in b):
-        merged.append(l)
-        seen.add(l.strip())
-pathlib.Path(out).write_text("\n".join(merged)+"\n", encoding='utf-8')
-print(f"  union merged {out}: {len(merged)} lines")
+      set +e
+      git merge-file -p "$ours" "$base" "$theirs" >"$merged"
+      merge_status=$?
+      set -e
+      python3 - "$merged" "$file" <<'PY'
+import pathlib
+import sys
+
+source, output = (pathlib.Path(value) for value in sys.argv[1:])
+lines = source.read_text(encoding="utf-8").splitlines()
+result = []
+i = 0
+while i < len(lines):
+    if lines[i].startswith("<<<<<<<"):
+        i += 1
+        while i < len(lines) and not lines[i].startswith("======="):
+            result.append(lines[i])
+            i += 1
+        while i < len(lines) and not lines[i].startswith(">>>>>>>"):
+            i += 1
+        if i < len(lines):
+            i += 1
+    else:
+        result.append(lines[i])
+        i += 1
+output.write_text("\n".join(result) + "\n", encoding="utf-8")
 PY
-      git add "$f"
+      git add "$file"
+      if [ "$merge_status" -gt 1 ]; then
+        echo "Unable to merge locale file $file" >&2
+        rm -f "$base" "$ours" "$theirs" "$merged"
+        return 1
+      fi
     fi
-    rm -f "$base" "$ours" "$theirs"
-  done
-  # Also ensure zh-CN.yml exists if only en.yml was conflicted (fork-specific)
-  if [ -f locales/zh-CN.yml ] && git diff --name-only --diff-filter=U | grep -q "zh-CN"; then
-    git add locales/zh-CN.yml || true
-  fi
+    rm -f "$base" "$ours" "$theirs" "$merged"
+  done < <(git diff --name-only --diff-filter=U | grep '^locales/' || true)
 }
 
-if [ $MERGE_STATUS -ne 0 ]; then
+echo "Attempting git merge --no-ff upstream/main..."
+set +e
+git merge --no-ff --no-edit upstream/main
+merge_status=$?
+set -e
+
+if [ "$merge_status" -ne 0 ]; then
   echo "Auto-resolving whitelisted conflicts..."
-  # Order matters: cargo.lock first (no dependency), then config, then audit, then locales
+  resolve_release_metadata
+  resolve_manifest kaku/Cargo.toml
+  resolve_manifest kaku-gui/Cargo.toml
   resolve_cargo_lock
   resolve_config_version
-  resolve_audit_yml
+  ensure_audit_step
   resolve_locales
 
-  # Check remaining conflicts
   remaining=$(git diff --name-only --diff-filter=U || true)
   if [ -n "$remaining" ]; then
     echo ""
     echo "ERROR: Remaining conflicts require manual resolution:"
     echo "$remaining"
-    echo ""
-    echo "Aborting merge. Resolve manually and commit."
     git merge --abort || true
     exit 2
   fi
 
-  echo "All whitelisted conflicts resolved, committing merge..."
-  # Stage already added files, commit the merge
-  git commit --no-edit || true
+  git commit --no-edit
 else
-  echo "Merge completed without conflicts"
-  # Still need to ensure config_version satisfies gate and Cargo.lock h2 is fixed
-  # (upstream may have brought back vulnerable h2)
+  # A clean merge is already committed. Apply invariant repairs, if any, as a
+  # small follow-up commit rather than silently dropping them.
   resolve_cargo_lock
-  # Check if cargo.lock was changed
-  if ! git diff --quiet; then
-    echo "Cargo.lock needed h2 fix after clean merge, committing"
-    git add Cargo.lock
-    git commit -m "chore(deps): ensure h2 >=0.4.16 after upstream merge" || true
-  fi
-  # Check config_version gate after clean merge
-  current_version=$(cat assets/shell-integration/config_version.txt | tr -d '[:space:]')
-  prev_tag=$(git tag --sort=-version:refname | grep -E '^[Vv][0-9]+\.[0-9]+\.[0-9]+$' | grep -Eiv "^v$(grep '^version =' "$REPO_ROOT/kaku/Cargo.toml" | head -n1 | cut -d'"' -f2)$" | head -n1 || true)
-  if [ -n "$prev_tag" ]; then
-    prev_version=$(git show "${prev_tag}:assets/shell-integration/config_version.txt" 2>/dev/null | tr -d '[:space:]' || echo "0")
-    if [[ "$prev_version" =~ ^[0-9]+$ ]]; then
-      min_version=$((prev_version + 1))
-      if [ "$current_version" -lt "$min_version" ]; then
-        echo "Clean merge but config_version $current_version < min $min_version, bumping"
-        echo "$min_version" > assets/shell-integration/config_version.txt
-        resolve_highlights "$min_version"
-        resolve_docs "$min_version"
-        git add assets/shell-integration/config_version.txt assets/shell-integration/config_update_highlights.tsv docs/config-versions.md
-        git commit -m "chore(config): bump config_version to $min_version after upstream merge" || true
-      fi
-    fi
-  fi
-  # Ensure audit.yml step present
-  if ! grep -q "Prepare Homebrew tap trust" .github/workflows/audit.yml; then
-    resolve_audit_yml
-    if ! git diff --quiet; then
-      git add .github/workflows/audit.yml
-      git commit -m "ci: preserve Homebrew tap trust step after upstream merge" || true
-    fi
+  resolve_config_version
+  ensure_audit_step
+  if ! git diff --quiet || ! git diff --cached --quiet; then
+    git add -A
+    git commit -m "chore(sync): preserve fork invariants after upstream merge"
   fi
 fi
 
 echo ""
 echo "=== Merge result ==="
 git log --oneline -5
-echo ""
-echo "Checking remaining changes:"
 git status --short
-echo ""
 echo "Sync upstream done."

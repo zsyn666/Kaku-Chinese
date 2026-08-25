@@ -34,6 +34,11 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.95.0
+
       - name: Sync upstream
         run: |
           chmod +x scripts/sync_upstream.sh
@@ -41,20 +46,12 @@ jobs:
 
       - name: Validate after merge
         run: |
-          echo "=== cargo audit (if available) ==="
-          # cargo-audit is not preinstalled on ubuntu; run via cargo if lock changed, otherwise skip
-          if command -v cargo-audit >/dev/null 2>&1; then
-            cargo audit || echo "cargo audit reported issues (check logs)"
-          else
-            echo "cargo-audit not installed, skipping (audit.yml runs on macos)"
-          fi
-          echo ""
           echo "=== Config checks ==="
           bash ./scripts/check_release_config.sh
           bash ./scripts/check_config_release_readiness.sh
           echo ""
           echo "=== Cargo check (locked) ==="
-          cargo check --locked -p kaku -p kaku-gui || echo "cargo check failed (see logs)"
+          cargo check --locked -p kaku -p kaku-gui
 
       - name: Push to main if updated
         run: |
