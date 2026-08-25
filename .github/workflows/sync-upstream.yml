@@ -63,3 +63,37 @@ jobs:
           fi
           echo "Pushing $(git rev-parse --short HEAD) to origin/main"
           git push origin HEAD:main
+
+      - name: Auto-tag to follow upstream release
+        if: success()
+        run: |
+          echo "Checking for upstream tags to mirror..."
+          git fetch upstream --tags --prune
+          # Get latest upstream semver tag (v/V)
+          latest_upstream_tag=$(git ls-remote --tags upstream | grep -E 'refs/tags/[Vv][0-9]+\.[0-9]+\.[0-9]+(\^\{\})?$' | sed -E 's|.*refs/tags/||; s|\^\{\}||' | grep -E '^[Vv][0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n1)
+          if [ -z "$latest_upstream_tag" ]; then
+            echo "No upstream tags found"
+            exit 0
+          fi
+          echo "Latest upstream tag: $latest_upstream_tag"
+          # Skip if tag already exists locally or on origin
+          if git rev-parse -q --verify "refs/tags/$latest_upstream_tag" >/dev/null; then
+            echo "Tag $latest_upstream_tag already exists locally"
+            exit 0
+          fi
+          if git ls-remote --tags origin | grep -q "refs/tags/$latest_upstream_tag$"; then
+            echo "Tag $latest_upstream_tag already exists on origin"
+            exit 0
+          fi
+          # Only auto-tag when Cargo.toml version matches the tag (ensures code is ready)
+          cargo_ver=$(grep '^version =' kaku/Cargo.toml | head -n1 | cut -d'"' -f2)
+          clean_tag=${latest_upstream_tag#[vV]}
+          if [ "$cargo_ver" != "$clean_tag" ]; then
+            echo "Cargo version $cargo_ver != upstream tag $clean_tag, skipping auto-tag"
+            echo "Will auto-tag when Cargo.toml catches up after merge"
+            exit 0
+          fi
+          echo "Creating tag $latest_upstream_tag at HEAD $(git rev-parse --short HEAD)"
+          git tag -a "$latest_upstream_tag" -m "$latest_upstream_tag synced from upstream"
+          git push origin tag "$latest_upstream_tag"
+          echo "Auto-tag $latest_upstream_tag pushed — release workflow will be triggered"
