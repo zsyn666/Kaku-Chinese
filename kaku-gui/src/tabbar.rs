@@ -7,7 +7,7 @@ use mux::tab::TabId;
 use mux::Mux;
 use std::path::Path;
 use termwiz::cell::{unicode_column_width, Cell, CellAttributes};
-use termwiz::color::{AnsiColor, ColorSpec};
+use termwiz::color::ColorSpec;
 use termwiz::escape::csi::Sgr;
 use termwiz::escape::parser::Parser;
 use termwiz::escape::{Action, ControlCode, CSI};
@@ -233,33 +233,6 @@ fn call_format_tab_title_hover(
     }
 }
 
-/// pct is a percentage in the range 0-100.
-/// We want to map it to one of the nerdfonts:
-///
-/// * `md-checkbox_blank_circle_outline` (0xf0130) for an empty circle
-/// * `md_circle_slice_1..=7` (0xf0a9e ..= 0xf0aa4) for a partly filled
-///   circle
-/// * `md_circle_slice_8` (0xf0aa5) for a filled circle
-///
-/// We use an empty circle for values close to 0%, a filled circle for values
-/// close to 100%, and a partly filled circle for the rest (roughly evenly
-/// distributed).
-fn pct_to_glyph(pct: u8) -> char {
-    match pct {
-        0..=5 => '\u{f0130}',    // empty circle
-        6..=18 => '\u{f0a9e}',   // centered at 12 (slightly smaller than 12.5)
-        19..=31 => '\u{f0a9f}',  // centered at 25
-        32..=43 => '\u{f0aa0}',  // centered at 37.5
-        44..=56 => '\u{f0aa1}',  // half-filled circle, centered at 50
-        57..=68 => '\u{f0aa2}',  // centered at 62.5
-        69..=81 => '\u{f0aa3}',  // centered at 75
-        82..=94 => '\u{f0aa4}',  // centered at 88 (slightly larger than 87.5)
-        95..=100 => '\u{f0aa5}', // filled circle
-        // Any other value is mapped to a filled circle.
-        _ => '\u{f0aa5}',
-    }
-}
-
 const CONTEXT_PROCESS_SEPARATOR: &str = "\u{00b7}";
 const MULTI_PANE_TITLE_SEPARATOR: &str = "\u{2219}";
 
@@ -466,29 +439,6 @@ fn build_default_title(
         title = format!("{}{classic_spacing}", title);
     }
 
-    if let Some(pane) = &tab.active_pane {
-        match pane.progress {
-            Progress::None => {}
-            Progress::Percentage(pct) | Progress::Error(pct) => {
-                if !config.use_fancy_tab_bar {
-                    let graphic = format!("{}", pct_to_glyph(pct));
-                    len += unicode_column_width(&graphic, None);
-                    let color = if matches!(pane.progress, Progress::Percentage(_)) {
-                        FormatItem::Foreground(FormatColor::AnsiColor(AnsiColor::Green))
-                    } else {
-                        FormatItem::Foreground(FormatColor::AnsiColor(AnsiColor::Red))
-                    };
-                    items.push(color);
-                    items.push(FormatItem::Text(graphic));
-                    items.push(FormatItem::Foreground(FormatColor::Default));
-                }
-            }
-            Progress::Indeterminate => {
-                // TODO: Decide what to do here to indicate this
-            }
-        }
-    }
-
     if with_edge_padding {
         title = format!(" {} ", title);
     } else if !config.use_fancy_tab_bar {
@@ -498,6 +448,18 @@ fn build_default_title(
     }
 
     items.push(FormatItem::Text(title));
+
+    let attention = matches!(tab.progress, Progress::Paused | Progress::Error(_))
+        || (config.bell_tab_indicator && tab.has_unread_bell);
+    if attention {
+        items.push(FormatItem::Foreground(FormatColor::Color(
+            "#daae76".to_string(),
+        )));
+        items.push(FormatItem::Text("\u{2022}".to_string()));
+        items.push(FormatItem::Foreground(FormatColor::Default));
+    } else {
+        items.push(FormatItem::Text(" ".to_string()));
+    }
 
     TitleText { items }
 }
@@ -1187,10 +1149,7 @@ impl TabBarState {
             items.push(TabEntry {
                 item: TabBarItem::Tab { tab_idx, active },
                 title,
-                progress: tab_info[tab_idx]
-                    .active_pane
-                    .as_ref()
-                    .map_or(Progress::None, |p| p.progress.clone()),
+                progress: tab_info[tab_idx].progress.clone(),
                 x: tab_start_idx,
                 width,
             });
@@ -1446,9 +1405,40 @@ mod test {
             is_active,
             is_last_active: false,
             active_pane: None,
+            progress: Progress::None,
+            has_unread_bell: false,
             window_id: 0,
             tab_title: title.to_string(),
         }
+    }
+
+    #[test]
+    fn default_tab_title_uses_one_trailing_status_cell() {
+        let config = ConfigHandle::default_config();
+        let mut tab = make_tab(0, 0, false, "claude");
+
+        let idle = build_default_title(&tab, &config, "claude", false, false);
+        assert!(plain_text(&idle).ends_with(' '));
+
+        // A running pane deliberately shows nothing: only attention gets a dot.
+        tab.progress = Progress::Indeterminate;
+        let running = build_default_title(&tab, &config, "claude", false, false);
+        assert!(plain_text(&running).ends_with(' '));
+
+        tab.progress = Progress::Paused;
+        let attention = build_default_title(&tab, &config, "claude", false, false);
+        assert!(plain_text(&attention).ends_with('\u{2022}'));
+    }
+
+    #[test]
+    fn unread_bell_uses_the_same_trailing_status_cell() {
+        let config = ConfigHandle::default_config();
+        let mut tab = make_tab(0, 0, false, "shell");
+        tab.has_unread_bell = true;
+
+        let title = build_default_title(&tab, &config, "shell", false, false);
+        assert_eq!(plain_text(&title).matches('\u{2022}').count(), 1);
+        assert!(plain_text(&title).ends_with('\u{2022}'));
     }
 
     #[test]

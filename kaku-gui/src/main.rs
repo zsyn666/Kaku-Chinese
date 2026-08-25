@@ -111,6 +111,7 @@ mod frontend;
 mod glyphcache;
 mod inline_ai;
 mod inputmap;
+mod local_hostname;
 #[cfg(target_os = "macos")]
 mod macos;
 mod overlay;

@@ -1,21 +1,25 @@
-# V0.18.2 Dual
+# V0.19.0 Restored
 
 <div align="center">
   <img src="https://raw.githubusercontent.com/tw93/Kaku/main/assets/logo.png" alt="Kaku Logo" width="120" height="120" />
-  <h1 style="margin: 12px 0 6px;">Kaku V0.18.2</h1>
+  <h1 style="margin: 12px 0 6px;">Kaku V0.19.0</h1>
   <p><em>A fast, out-of-the-box terminal built for AI coding.</em></p>
 </div>
 
 ### Changelog
 
-1. **Universal by Default**: `make app` now builds a universal binary (arm64 + x64) so local debug builds match release artifacts.
-2. **Split Packages**: Release now ships `Kaku.dmg` (universal) plus `Kaku-arm64.dmg` and `Kaku-x64.dmg` for smaller per-architecture downloads.
-3. **Security Audit Fixes**: Updated `h2` to 0.4.16 for `RUSTSEC-2026-0258` and trusted Homebrew `aws/tap` to clear CI annotations.
+1. **Pane Input Broadcast Removed**: It was too easy to trigger by accident and could repeat a risky command in unrelated panes, so existing key assignments now do nothing.
+2. **Sessions Restore More Completely**: Reopening Kaku brings back your windows, their panes, and each pane's directory, and one pane that fails to save no longer costs you the rest.
+3. **Closing No Longer Hits the Wrong Pane**: A close confirmation stays tied to the pane it belongs to, and closing the active tab leaves you on the expected one.
+4. **Display and Integration Fixes**: Light-theme selections stay visible, lazygit works in nested shells, clearing history leaves full-screen programs intact, tab renaming no longer freezes titles, and slow synchronized output stops tearing.
 
 ### 更新日志
 
-1. **默认 Universal**：`make app` 现默认构建 Universal 包（arm64 + x64），本地调试产物与发布产物一致。
-2. **双包分发**：发布同时提供 `Kaku.dmg`（Universal）以及 `Kaku-arm64.dmg` 与 `Kaku-x64.dmg`，按需下载更小体积。
-3. **安全审计修复**：更新 `h2` 至 0.4.16 修复 `RUSTSEC-2026-0258`，并信任 Homebrew `aws/tap` 清除 CI 告警。
+1. **移除分屏输入广播**：这个功能容易误触，会把危险命令重复到无关分屏，原有快捷键保留但不再生效。
+2. **会话恢复更完整**：重新打开时窗口、分屏和各自的目录都会还原，个别分屏未能保存也不影响其余。
+3. **关闭不再误伤其他分屏**：确认框始终对应打开它的分屏，关闭当前标签页后会停在预期的标签页。
+4. **显示与集成修复**：浅色主题选中内容清晰可见，lazygit 支持嵌套 shell，清空历史不打断全屏程序，重命名标签页不卡住标题，慢速同步输出不再撕裂。
+
+Special thanks to @shlroland and @dufu1991 for their contributions to this release.
 
 > https://github.com/tw93/Kaku

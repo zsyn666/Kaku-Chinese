@@ -1,4 +1,3 @@
-use crate::color::LinearRgba;
 use crate::customglyph::*;
 use crate::tabbar::{TabBarItem, TabEntry};
 use crate::termwindow::box_model::*;
@@ -11,7 +10,6 @@ use config::{Dimension, DimensionContext, TabBarColors};
 use std::rc::Rc;
 use wezterm_font::LoadedFont;
 use wezterm_term::color::{ColorAttribute, ColorPalette};
-use wezterm_term::Progress;
 use window::{IntegratedTitleButtonAlignment, IntegratedTitleButtonStyle};
 
 const X_BUTTON: &[Poly] = &[
@@ -51,17 +49,6 @@ const PLUS_BUTTON: &[Poly] = &[
         style: PolyStyle::Outline,
     },
 ];
-
-const PROGRESS_CIRCLE_POLY: &[Poly] = &[Poly {
-    path: &[PolyCommand::Circle {
-        center: (BlockCoord::Frac(1, 2), BlockCoord::Frac(1, 2)),
-        radius: BlockCoord::Frac(1, 2),
-    }],
-    intensity: BlockAlpha::Full,
-    style: PolyStyle::Fill,
-}];
-
-const PROGRESS_DOT_SIZE: f32 = 14.0;
 
 impl crate::TermWindow {
     pub fn invalidate_fancy_tab_bar(&mut self) {
@@ -362,41 +349,6 @@ impl crate::TermWindow {
                         ElementContent::Text(_) => unreachable!(),
                         ElementContent::Poly { .. } => unreachable!(),
                         ElementContent::Children(mut kids) => {
-                            if item.progress != Progress::None {
-                                let dot_color = match &item.progress {
-                                    Progress::Error(_) => {
-                                        LinearRgba::with_components(1.0, 0.27, 0.27, 0.85)
-                                    }
-                                    Progress::Percentage(_) | Progress::Indeterminate => {
-                                        LinearRgba::with_components(0.27, 0.85, 0.27, 0.85)
-                                    }
-                                    Progress::None => unreachable!(),
-                                };
-                                let dot = Element::new(
-                                    &font,
-                                    ElementContent::Poly {
-                                        line_width: 0,
-                                        poly: SizedPoly {
-                                            poly: PROGRESS_CIRCLE_POLY,
-                                            width: Dimension::Pixels(PROGRESS_DOT_SIZE),
-                                            height: Dimension::Pixels(PROGRESS_DOT_SIZE),
-                                        },
-                                    },
-                                )
-                                .vertical_align(VerticalAlign::Middle)
-                                .colors(ElementColors {
-                                    border: BorderColor::default(),
-                                    bg: LinearRgba::TRANSPARENT.into(),
-                                    text: dot_color.into(),
-                                })
-                                .margin(BoxDimension {
-                                    left: Dimension::Cells(0.),
-                                    right: Dimension::Pixels(0.),
-                                    top: Dimension::Cells(0.),
-                                    bottom: Dimension::Cells(0.),
-                                });
-                                kids.insert(0, dot);
-                            }
                             if self.config.show_close_tab_button_in_tabs {
                                 kids.push(make_x_button(&font, &metrics, &colors, tab_idx, active));
                             }

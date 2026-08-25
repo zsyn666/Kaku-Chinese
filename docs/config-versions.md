@@ -32,6 +32,8 @@ instruction files; read the txt file instead.
 | v30 | V0.16.0 | No schema change. Bumps so existing installs regenerate shell integrations that authenticate inline AI control messages with a local capability before terminal output can trigger assistant requests, and that scope the Starship prompt setup to Kaku instead of every zsh. |
 | v31 | V0.17.0 | Adds the optional `file_link_editor` setting for choosing which editor opens local terminal file links, bare-domain Cmd+Click links (e.g. `github.com` without a scheme), and Option+Click cursor movement within the current input line. Also regenerates shell integrations with the #511 fixes: the inline AI capability file is read tolerantly (zsh/fish `read` treat a missing trailing newline as EOF failure), user-var guards report failure with `return 1` instead of masking it, and the fish widget only enters the waiting state after the request was actually emitted. The Rust side also writes the capability file with a trailing newline for new installs. |
 | v32 | V0.18.0 | No schema change, and no bundled-integration change either; increments only because the release gate requires a bump every release. The release highlights reuse the new Move Tab to New Window command and the multi-display menu bar clamp fix. |
-| v33 | - | No schema change. Bumps to satisfy the release gate after the Security Audit fixes (h2 0.4.13 -> 0.4.16 for RUSTSEC-2026-0258 and Homebrew `aws/tap` trust). |
+| v33 | V0.19.0 | No schema change. Bumps so existing installs pick up two bundled fixes: light-theme selected rows keep a visibly blue background instead of washing out to near-white, and the lazygit launcher resolves its working directory from the shell that actually receives the input, so it also works inside nested shells. |
+
+| v34 | - | No schema change. Bumps to satisfy the release gate after automatic upstream synchronization. |
 
 When you bump the version, add a row here in the same change.

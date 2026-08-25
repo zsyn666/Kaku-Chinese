@@ -28,7 +28,6 @@ mod ui;
 use providers::*;
 
 const FOLLOW_CODEX_MODEL: &str = "Follow Codex";
-
 fn codex_home_dir() -> PathBuf {
     kaku_ai_utils::codex_home_dir(&config::HOME_DIR)
 }

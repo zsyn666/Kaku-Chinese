@@ -559,7 +559,7 @@ impl crate::TermWindow {
                     pos.pane.advise_focus();
                     mux::Mux::get().record_focus_for_current_identity(pos.pane.pane_id());
                 }
-                // Bell state cleared in clear_active_tab_bell_state() to ensure badge sync
+                // Attention state is cleared for this focused pane after panes render.
             }
             self.paint_pane(&pos, &mut layers).context("paint_pane")?;
         }
@@ -605,8 +605,9 @@ impl crate::TermWindow {
             }
         }
 
-        // Clear bell state for active tab and update Dock badge (always, regardless of tab bar visibility)
-        self.clear_active_tab_bell_state();
+        // Clear attention only for the focused pane. Other panes in the active
+        // tab keep their unread state until the user focuses them.
+        self.clear_active_pane_attention_state();
 
         // Draw visual notification dot on inactive tabs with unread bell
         if self.show_tab_bar {
@@ -623,37 +624,21 @@ impl crate::TermWindow {
         Ok(())
     }
 
-    /// Clear bell state for all panes in the active tab and update global Dock badge.
-    /// Called every paint cycle to ensure badge stays in sync regardless of tab bar visibility.
-    /// Only clears when window has focus, so Dock badge persists while window is unfocused.
-    fn clear_active_tab_bell_state(&mut self) {
+    /// Clear notification and bell state for the focused pane only.
+    /// Called every paint cycle so state stays in sync even when the tab bar is hidden.
+    fn clear_active_pane_attention_state(&mut self) {
         if self.focused.is_none() {
             return;
         }
-        // Fast path: skip mux lock if no panes have unread bells
-        if !self.pane_state.borrow().values().any(|s| s.has_unread_bell) {
+        let Some(pane) = self.get_active_pane_or_overlay() else {
             return;
-        }
-        let mux = mux::Mux::get();
-        let mux_window = match mux.get_window(self.mux_window_id) {
-            Some(w) => w,
-            None => return,
         };
-        let active_tab_idx = mux_window.get_active_idx();
-
-        if let Some(active_tab) = mux_window.get_by_idx(active_tab_idx) {
-            let active_tab_panes = active_tab.iter_panes_ignoring_zoom();
-            let mut cleared_count: isize = 0;
-            for pos in &active_tab_panes {
-                let mut state = self.pane_state(pos.pane.pane_id());
-                if state.has_unread_bell {
-                    state.has_unread_bell = false;
-                    cleared_count += 1;
-                }
-            }
-            if cleared_count > 0 {
-                crate::frontend::front_end().adjust_unread_bell_count(-cleared_count);
-            }
+        let mut state = self.pane_state(pane.pane_id());
+        state.has_unread_notification = false;
+        if state.has_unread_bell {
+            state.has_unread_bell = false;
+            drop(state);
+            crate::frontend::front_end().adjust_unread_bell_count(-1);
         }
     }
 

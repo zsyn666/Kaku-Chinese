@@ -1032,6 +1032,7 @@ impl super::TermWindow {
 
         if window_key.key_is_down {
             let mut state = self.pane_state(pane.pane_id());
+            state.has_unread_notification = false;
             if state.has_unread_bell {
                 state.has_unread_bell = false;
                 drop(state);

@@ -811,7 +811,7 @@ end
 --
 -- 11) Split pane
 -- config.split_pane_gap = 6                          -- default 2
--- config.inactive_pane_hsb = { saturation = 1.0, brightness = 0.9 }
+-- config.inactive_pane_hsb = { hue = 0.95, saturation = 1.0, brightness = 0.9 }
 --
 -- 12) Fullscreen (set false if you use yabai/AeroSpace tiling)
 -- config.native_macos_fullscreen_mode = false
@@ -992,6 +992,18 @@ mod tests {
     }
 
     #[test]
+    fn minimal_user_config_documents_inactive_pane_hue() {
+        let content = minimal_user_config_template();
+
+        assert!(
+            content.contains(
+                "config.inactive_pane_hsb = { hue = 0.95, saturation = 1.0, brightness = 0.9 }"
+            ),
+            "generated user config should expose every inactive-pane HSB component"
+        );
+    }
+
+    #[test]
     fn bundled_kaku_lua_uses_config_for_remember_last_cwd() {
         let bundled = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../assets/macos/Kaku.app/Contents/Resources/kaku.lua");
@@ -1087,6 +1099,8 @@ local tab = {{
   active_pane = panes[{pane_count}],
   panes = panes,
   tab_title = '',
+  status = 'none',
+  has_unread_bell = false,
 }}
 local effective_config = {{
   bell_tab_indicator = true,
@@ -1145,8 +1159,60 @@ return tab, {{ tab }}, panes, effective_config
                 assert_eq!(
                     last_text.as_deref(),
                     Some(" "),
-                    "the trailing bell slot must survive a {max_width}-column budget"
+                    "the trailing status slot must survive a {max_width}-column budget"
                 );
+            }
+
+            if pane_count == 1 {
+                let render_status = |status: &str,
+                                     has_unread_bell: bool|
+                 -> anyhow::Result<(String, Option<String>)> {
+                    tab.set("status", status)?;
+                    tab.set("has_unread_bell", has_unread_bell)?;
+                    let value = crate::lua::emit_sync_callback(
+                        &lua,
+                        (
+                            "format-tab-title".to_string(),
+                            (
+                                tab.clone(),
+                                tabs.clone(),
+                                panes.clone(),
+                                config.clone(),
+                                false,
+                                32,
+                            ),
+                        ),
+                    )?;
+                    let items = match value {
+                        mlua::Value::Table(items) => items,
+                        other => anyhow::bail!("expected format items, got {other:?}"),
+                    };
+                    let mut last_text = String::new();
+                    let mut last_color = None;
+                    for item in items.sequence_values::<mlua::Table>() {
+                        let item = item?;
+                        if let Some(foreground) =
+                            item.get::<_, Option<mlua::Table>>("Foreground")?
+                        {
+                            last_color = foreground.get::<_, Option<String>>("Color")?;
+                        }
+                        if let Some(text) = item.get::<_, Option<String>>("Text")? {
+                            last_text = text;
+                        }
+                    }
+                    Ok((last_text, last_color))
+                };
+
+                assert_eq!(render_status("running", false)?.0, " ");
+                assert_eq!(
+                    render_status("attention", false)?,
+                    ("\u{2022}".to_string(), Some("#daae76".to_string()))
+                );
+                assert_eq!(
+                    render_status("running", true)?,
+                    ("\u{2022}".to_string(), Some("#daae76".to_string()))
+                );
+                assert_eq!(render_status("none", false)?.0, " ");
             }
         }
 

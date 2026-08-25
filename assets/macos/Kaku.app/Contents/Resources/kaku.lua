@@ -3091,23 +3091,9 @@ local KAKU = {
   RED = '#d85d5d',
 }
 
--- Track bell events per pane for tab notification indicator.
--- Unlike has_unseen_output (which fires on any output, making the indicator
--- permanently lit for TUI apps like Claude Code), bell events only fire when
--- a program explicitly sends BEL (\a), making them suitable as completion signals.
-local _bell_panes = {}
-local _last_bell_evict_secs = 0
+local _last_pane_state_evict_secs = 0
 
-wezterm.on('bell', function(window, pane)
-  _bell_panes[tostring(pane:pane_id())] = true
-end)
-
-local function evict_stale_bell_panes(live_pane_ids)
-  for pane_id in pairs(_bell_panes) do
-    if not live_pane_ids[pane_id] then
-      _bell_panes[pane_id] = nil
-    end
-  end
+local function evict_stale_pane_state(live_pane_ids)
   for pane_id in pairs(ai_fix_state_by_pane) do
     if not live_pane_ids[pane_id] then
       ai_fix_state_by_pane[pane_id] = nil
@@ -3144,21 +3130,6 @@ local function tab_pane_keys(tab)
   end
 
   return keys
-end
-
-local function tab_has_bell_from_keys(pane_keys)
-  for _, pane_key in ipairs(pane_keys) do
-    if _bell_panes[pane_key] then
-      return true
-    end
-  end
-  return false
-end
-
-local function clear_tab_bells_from_keys(pane_keys)
-  for _, pane_key in ipairs(pane_keys) do
-    _bell_panes[pane_key] = nil
-  end
 end
 
 local function tab_display_title(tab, effective_config)
@@ -3204,23 +3175,24 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, effective_config, hove
     end
     evict_stale_cache(live_pane_ids)
     local now = now_secs()
-    if now - _last_bell_evict_secs >= 5 then
-      evict_stale_bell_panes(live_pane_ids)
-      _last_bell_evict_secs = now
+    if now - _last_pane_state_evict_secs >= 5 then
+      evict_stale_pane_state(live_pane_ids)
+      _last_pane_state_evict_secs = now
     end
   end
 
   local tab_bar_colors = effective_config.resolved_palette.tab_bar
-  local pane_keys = tab_pane_keys(tab)
-  local has_bell = tab_has_bell_from_keys(pane_keys)
-  if has_bell and tab.is_active then
-    clear_tab_bells_from_keys(pane_keys)
-    has_bell = false
-  end
+  local has_bell = tab.has_unread_bell == true
+  local tab_status = tab.status or 'none'
 
   local tab_bg = tab_bar_colors and tab_bar_colors.background
   local is_light = tab_bg == '#FFFCF0' or tab_bg == '#fffcf0'
-  local dot_color = is_light and '#AD8301' or KAKU.ORANGE
+  local attention_dot_color = is_light and '#AD8301' or KAKU.ORANGE
+  -- Only attention gets a dot; a running state would need someone to keep
+  -- feeding the terminal progress events to stay honest.
+  local status_dot = tab_status == 'attention'
+    or (has_bell and effective_config.bell_tab_indicator ~= false)
+  local status_dot_color = attention_dot_color
 
   local fg_active = KAKU.WHITE
   local fg_inactive_pane = KAKU.GRAY
@@ -3389,13 +3361,9 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, effective_config, hove
       end
     end
 
-    -- Trailing bell dot or space
-    if effective_config.bell_tab_indicator ~= false then
-      items[#items + 1] = { Foreground = { Color = has_bell and dot_color or fg_active } }
-      items[#items + 1] = { Text = has_bell and '\u{2022}' or ' ' }
-    else
-      items[#items + 1] = { Text = ' ' }
-    end
+    -- One stable trailing cell: attention wins over running, idle stays blank.
+    items[#items + 1] = { Foreground = { Color = status_dot and status_dot_color or fg_active } }
+    items[#items + 1] = { Text = status_dot and '\u{2022}' or ' ' }
 
     return items
   end
@@ -3429,22 +3397,13 @@ wezterm.on('format-tab-title', function(tab, tabs, panes, effective_config, hove
 
   local intensity = tab.is_active and 'Bold' or 'Normal'
 
-  -- Bell indicator: the dot occupies the same 1-cell slot as the trailing space
-  -- so tab width stays constant (N+2) whether or not a bell is pending.
-  if effective_config.bell_tab_indicator ~= false then
-    return {
-      { Attribute = { Intensity = intensity } },
-      { Foreground = { Color = fg_active } },
-      { Text = leading .. text },
-      { Foreground = { Color = has_bell and dot_color or fg_active } },
-      { Text = has_bell and '\u{2022}' or ' ' },
-    }
-  end
-
+  -- The status dot replaces the trailing space without changing tab width.
   return {
     { Attribute = { Intensity = intensity } },
     { Foreground = { Color = fg_active } },
-    { Text = leading .. text .. ' ' },
+    { Text = leading .. text },
+    { Foreground = { Color = status_dot and status_dot_color or fg_active } },
+    { Text = status_dot and '\u{2022}' or ' ' },
   }
 end)
 

@@ -80,3 +80,9 @@
 32	跨显示器拖动窗口时，标题栏不会再卡在菜单栏后面
 33	Security Audit maintenance: update h2 to 0.4.16 for RUSTSEC-2026-0258 and trust Homebrew tap
 33	安全审计维护：更新 h2 至 0.4.16 修复 RUSTSEC-2026-0258 并信任 Homebrew tap
+33	Selected rows stay visibly blue in the light theme instead of washing out to near-white
+33	浅色主题下选中行保持明显的蓝色，不再淡到几乎看不见
+33	lazygit opens from the shell that actually receives the input, so it works inside nested shells
+33	lazygit 会从真正接收输入的 shell 打开，嵌套 shell 里也能正常用
+34	Security Audit maintenance: update h2 to 0.4.16 and preserve cross-architecture release support
+34	安全审计维护：更新 h2 至 0.4.16 并保持双架构发布支持

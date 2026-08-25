@@ -57,9 +57,10 @@ fn build_terminal_context(
     let (_, tab_lines) = pane.get_lines(tab_top..bottom);
     let tab_snapshot = tab_snapshot_text(&tab_lines);
 
+    let local_hostname = crate::local_hostname::current();
     let (cwd, remote_host) = pane
         .get_current_working_dir(CachePolicy::AllowStale)
-        .map(|u| split_cwd_url(&u, &local_hostname()))
+        .map(|u| split_cwd_url(&u, local_hostname.as_deref()))
         .unwrap_or_default();
     let selected_text = term.selection_text(pane);
 
@@ -85,36 +86,20 @@ fn build_terminal_context(
     }
 }
 
-fn local_hostname() -> String {
-    static HOSTNAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
-    HOSTNAME
-        .get_or_init(|| {
-            hostname::get()
-                .ok()
-                .and_then(|h| h.into_string().ok())
-                .unwrap_or_default()
-        })
-        .clone()
-}
-
 /// Split an OSC 7 cwd URL into a path plus the remote host, if any.
 ///
 /// OSC 7 emits `file://<hostname>/path`; a host that is neither empty,
 /// `localhost`, nor this machine means the pane is inside an ssh (or other
-/// remote) session and the path must not be treated as local. Hostnames are
-/// compared case-insensitively and by first label, because the remote side
-/// may report a short name while macOS reports `name.local` (or vice versa).
-fn split_cwd_url(url: &url::Url, local_host: &str) -> (String, Option<String>) {
+/// remote) session and the path must not be treated as local. Hostnames must
+/// match exactly after case and trailing-dot normalization; their first labels
+/// are not unique identities.
+fn split_cwd_url(url: &url::Url, local_host: Option<&str>) -> (String, Option<String>) {
     let path = url.path().to_string();
     let host = url.host_str().unwrap_or("");
     if url.scheme() != "file" {
         return (path, Some(host.to_string()));
     }
-    if host.is_empty() || host.eq_ignore_ascii_case("localhost") {
-        return (path, None);
-    }
-    let first_label = |s: &str| s.split('.').next().unwrap_or(s).to_ascii_lowercase();
-    if !local_host.is_empty() && first_label(host) == first_label(local_host) {
+    if crate::local_hostname::is_local_file_host(url.host_str(), local_host) {
         return (path, None);
     }
     (path, Some(host.to_string()))
@@ -220,7 +205,7 @@ mod tests {
     }
 
     fn cwd(url: &str, local: &str) -> (String, Option<String>) {
-        split_cwd_url(&url::Url::parse(url).unwrap(), local)
+        split_cwd_url(&url::Url::parse(url).unwrap(), Some(local))
     }
 
     #[test]
@@ -231,11 +216,7 @@ mod tests {
             ("/Users/a".into(), None)
         );
         assert_eq!(
-            cwd("file://mac.local/Users/a", "mac"),
-            ("/Users/a".into(), None)
-        );
-        assert_eq!(
-            cwd("file://MAC/Users/a", "mac.local"),
+            cwd("file://MAC.LOCAL./Users/a", "mac.local"),
             ("/Users/a".into(), None)
         );
     }
@@ -249,6 +230,14 @@ mod tests {
         assert_eq!(
             cwd("file://build.corp.example/srv", "mac"),
             ("/srv".into(), Some("build.corp.example".into()))
+        );
+        assert_eq!(
+            cwd("file://mac/home/u", "mac.local"),
+            ("/home/u".into(), Some("mac".into()))
+        );
+        assert_eq!(
+            cwd("file://mac.corp.example/srv", "mac.local"),
+            ("/srv".into(), Some("mac.corp.example".into()))
         );
     }
 

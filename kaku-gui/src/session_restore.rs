@@ -513,13 +513,38 @@ fn collect_leaf_entries(node: &SavedPaneNode, out: &mut Vec<SavedPaneEntry>) {
     }
 }
 
+/// Convert a saved `file://` working-directory URL into a spawnable path.
+///
+/// Returns `None` for non-file schemes and for hosts that do not identify
+/// this machine, so a foreign (e.g. ssh) cwd never leaks into a local spawn.
 fn cwd_from_working_dir(working_dir: Option<&SerdeUrl>) -> Option<String> {
+    let local_hostname = crate::local_hostname::current();
+    cwd_from_working_dir_with_hostname(working_dir, local_hostname.as_deref())
+}
+
+fn cwd_from_working_dir_with_hostname(
+    working_dir: Option<&SerdeUrl>,
+    local_hostname: Option<&str>,
+) -> Option<String> {
     let url = working_dir?;
     if url.url.scheme() != "file" {
         return None;
     }
-    url.url
-        .to_file_path()
+    let mut url = url.url.clone();
+    if let Some(host) = url.host_str() {
+        // `to_file_path` refuses any host other than empty or `localhost`,
+        // but OSC 7 reporters conventionally use the real local hostname.
+        // Treat this machine's exact hostname as local; any other host keeps the
+        // strict behavior so a remote cwd cannot leak into a local spawn.
+        if crate::local_hostname::is_local_file_host(Some(host), local_hostname) {
+            // `Url::set_host(None)` updates the serialized file URL but leaves
+            // its internal host value intact in url 2.5.7, so `to_file_path`
+            // still rejects it. Rewrite a proven-local host to the one value
+            // that `to_file_path` explicitly accepts.
+            url.set_host(Some("localhost")).ok()?;
+        }
+    }
+    url.to_file_path()
         .ok()
         .map(|path| path.to_string_lossy().into_owned())
 }
@@ -533,9 +558,10 @@ fn is_ssh_domain_name(name: &str) -> bool {
 /// An ssh-domain pane's OSC 7 cwd is `file://<remote-host>/path`;
 /// `to_file_path` refuses remote-host URLs, so those panes used to restore
 /// into the remote home directory. The path component is meaningful on the
-/// remote side, so pass it through for ssh domains. Local domains keep the
-/// strict local conversion: a leftover remote path would make a local spawn
-/// fail or land in an unrelated same-named directory.
+/// remote side, so pass it through for ssh domains. Local domains accept
+/// empty/`localhost` hosts plus this machine's exact hostname (see
+/// `cwd_from_working_dir`); any other host still fails conversion, so a
+/// leftover remote path cannot leak into a local spawn.
 fn cwd_for_restore(domain_name: &str, working_dir: Option<&SerdeUrl>) -> Option<String> {
     if is_ssh_domain_name(domain_name) {
         let url = working_dir?;
@@ -1466,9 +1492,43 @@ mod tests {
             cwd_for_restore("local", Some(&serde_url("file:///Users/a/src"))).as_deref(),
             Some("/Users/a/src")
         );
+        assert_eq!(
+            cwd_for_restore("local", Some(&serde_url("file://localhost/Users/a/src"))).as_deref(),
+            Some("/Users/a/src")
+        );
         // A remote-host cwd must not leak into a local spawn.
         assert_eq!(
             cwd_for_restore("local", Some(&serde_url("file://server/home/u"))),
+            None
+        );
+    }
+
+    #[test]
+    fn restore_cwd_local_domain_accepts_exact_local_hostname() {
+        // URL parsing lowercases the host; the comparison must not care.
+        assert_eq!(
+            cwd_from_working_dir_with_hostname(
+                Some(&serde_url("file://MAC.LOCAL/Users/a/src")),
+                Some("mac.local"),
+            )
+            .as_deref(),
+            Some("/Users/a/src")
+        );
+        // A trailing dot (FQDN form) still identifies this machine.
+        assert_eq!(
+            cwd_from_working_dir_with_hostname(
+                Some(&serde_url("file://mac.local./Users/a/src")),
+                Some("mac.local"),
+            )
+            .as_deref(),
+            Some("/Users/a/src")
+        );
+        // A short remote host with the same first label is not local proof.
+        assert_eq!(
+            cwd_from_working_dir_with_hostname(
+                Some(&serde_url("file://mac/Users/a/src")),
+                Some("mac.local"),
+            ),
             None
         );
     }

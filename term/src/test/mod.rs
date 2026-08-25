@@ -1765,6 +1765,20 @@ fn test_alternate_scroll_mode_marks_mouse_grabbed() {
 }
 
 #[test]
+fn conemu_progress_preserves_paused_state() {
+    let mut term = TestTerm::new(2, 10, 0);
+
+    term.print("\x1b]9;4;3\x07");
+    assert_eq!(term.get_progress(), Progress::Indeterminate);
+
+    term.print("\x1b]9;4;4\x07");
+    assert_eq!(term.get_progress(), Progress::Paused);
+
+    term.print("\x1b]9;4;0\x07");
+    assert_eq!(term.get_progress(), Progress::None);
+}
+
+#[test]
 fn test_alternate_scroll_mode_cleared_on_soft_reset() {
     let mut term = TestTerm::new(5, 10, 100);
     term.set_mode("?1007", true);

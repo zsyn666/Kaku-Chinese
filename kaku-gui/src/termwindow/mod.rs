@@ -750,7 +750,31 @@ pub struct PaneState {
 
     bell_start: Option<Instant>,
     pub has_unread_bell: bool,
+    pub has_unread_notification: bool,
     pub mouse_terminal_coords: Option<(ClickPosition, StableRowIndex)>,
+}
+
+/// The trailing tab cell only reports attention, never a running state:
+/// a running indicator needs someone to keep feeding the terminal progress
+/// events, while attention is a one-shot signal any program can emit.
+fn aggregate_tab_progress<I>(panes: I) -> Progress
+where
+    I: IntoIterator<Item = (Progress, bool)>,
+{
+    for (progress, has_unread_notification) in panes {
+        if has_unread_notification || matches!(progress, Progress::Paused | Progress::Error(_)) {
+            return Progress::Paused;
+        }
+    }
+
+    Progress::None
+}
+
+fn tab_status_name(progress: &Progress) -> &'static str {
+    match progress {
+        Progress::Paused | Progress::Error(_) => "attention",
+        Progress::Percentage(_) | Progress::Indeterminate | Progress::None => "none",
+    }
 }
 
 /// Data used when synchronously formatting pane and window titles
@@ -761,6 +785,8 @@ pub struct TabInformation {
     pub is_active: bool,
     pub is_last_active: bool,
     pub active_pane: Option<PaneInformation>,
+    pub progress: Progress,
+    pub has_unread_bell: bool,
     pub window_id: MuxWindowId,
     pub tab_title: String,
 }
@@ -778,6 +804,8 @@ impl UserData for TabInformation {
                 Ok(None)
             }
         });
+        fields.add_field_method_get("status", |_, this| Ok(tab_status_name(&this.progress)));
+        fields.add_field_method_get("has_unread_bell", |_, this| Ok(this.has_unread_bell));
         fields.add_field_method_get("panes", |_, this| {
             let mux = Mux::get();
             let mut panes = vec![];
@@ -1295,6 +1323,7 @@ impl TermWindow {
             pane.focus_changed(focused);
             if focused {
                 let mut state = self.pane_state(pane.pane_id());
+                state.has_unread_notification = false;
                 if state.has_unread_bell {
                     state.has_unread_bell = false;
                     drop(state);
@@ -2311,6 +2340,13 @@ impl TermWindow {
                 } => {
                     self.emit_user_var_event(pane_id, name, value);
                 }
+                MuxNotification::Alert {
+                    alert: Alert::Progress(_),
+                    pane_id,
+                } => {
+                    let _ = pane_id;
+                    self.update_title();
+                }
                 MuxNotification::WindowTitleChanged { .. }
                 | MuxNotification::Alert {
                     alert:
@@ -2318,8 +2354,7 @@ impl TermWindow {
                         | Alert::CurrentWorkingDirectoryChanged
                         | Alert::WindowTitleChanged(_)
                         | Alert::TabTitleChanged(_)
-                        | Alert::IconTitleChanged(_)
-                        | Alert::Progress(_),
+                        | Alert::IconTitleChanged(_),
                     ..
                 } => {
                     self.update_title();
@@ -2415,9 +2450,39 @@ impl TermWindow {
                     window.invalidate();
                 }
                 MuxNotification::Alert {
-                    alert: Alert::ToastNotification { .. },
-                    ..
-                } => {}
+                    alert:
+                        Alert::ToastNotification {
+                            title,
+                            body,
+                            focus: _,
+                        },
+                    pane_id,
+                } => {
+                    if !self.window_contains_pane(pane_id) {
+                        return Ok(());
+                    }
+
+                    let is_inactive = self
+                        .get_active_pane_or_overlay()
+                        .map_or(true, |pane| pane.pane_id() != pane_id);
+                    let window_has_focus = self.focused.is_some();
+                    if is_inactive || !window_has_focus {
+                        self.pane_state(pane_id).has_unread_notification = true;
+                    }
+
+                    if !window_has_focus {
+                        ToastNotification {
+                            title: title.unwrap_or_else(|| "Kaku".to_string()),
+                            message: body,
+                            url: None,
+                            timeout: Some(Duration::from_secs(5)),
+                        }
+                        .show();
+                    }
+
+                    self.update_title();
+                    window.invalidate();
+                }
                 MuxNotification::TabAddedToWindow {
                     window_id: _,
                     tab_id,
@@ -6179,21 +6244,41 @@ impl TermWindow {
         window
             .iter()
             .enumerate()
-            .map(|(idx, tab)| TabInformation {
-                tab_index: idx,
-                tab_id: tab.tab_id(),
-                is_active: tab_index == idx,
-                is_last_active: window
-                    .get_last_active_idx()
-                    .map(|last_active| last_active == idx)
-                    .unwrap_or(false),
-                window_id: self.mux_window_id,
-                tab_title: tab.get_title(),
-                active_pane: tab
-                    .iter_panes()
-                    .into_iter()
-                    .find(|p| p.is_active)
-                    .map(|p| Self::pos_pane_to_pane_info(&p)),
+            .map(|(idx, tab)| {
+                let panes = tab.iter_panes_ignoring_zoom();
+                let pane_state = self.pane_state.borrow();
+                let progress = aggregate_tab_progress(panes.iter().map(|pos| {
+                    let state = pane_state.get(&pos.pane.pane_id());
+                    (
+                        pos.pane.get_progress(),
+                        state.is_some_and(|state| state.has_unread_notification),
+                    )
+                }));
+                let has_unread_bell = panes.iter().any(|pos| {
+                    pane_state
+                        .get(&pos.pane.pane_id())
+                        .is_some_and(|state| state.has_unread_bell)
+                });
+                drop(pane_state);
+
+                TabInformation {
+                    tab_index: idx,
+                    tab_id: tab.tab_id(),
+                    is_active: tab_index == idx,
+                    is_last_active: window
+                        .get_last_active_idx()
+                        .map(|last_active| last_active == idx)
+                        .unwrap_or(false),
+                    window_id: self.mux_window_id,
+                    tab_title: tab.get_title(),
+                    active_pane: tab
+                        .iter_panes()
+                        .into_iter()
+                        .find(|p| p.is_active)
+                        .map(|p| Self::pos_pane_to_pane_info(&p)),
+                    progress,
+                    has_unread_bell,
+                }
             })
             .collect()
     }
@@ -6354,13 +6439,41 @@ impl Drop for TermWindow {
 #[cfg(test)]
 mod tests {
     use super::{
-        bell_notification_message, scrollback_erase_mode_for_pane, FileLinkTarget, MouseCapture,
-        RenderableDimensions, TermWindow,
+        aggregate_tab_progress, bell_notification_message, scrollback_erase_mode_for_pane,
+        FileLinkTarget, MouseCapture, RenderableDimensions, TermWindow,
     };
     use config::keyassignment::ScrollbackEraseMode;
     use mux::pane::PaneId;
     use std::path::PathBuf;
-    use wezterm_term::StableRowIndex;
+    use wezterm_term::{Progress, StableRowIndex};
+
+    #[test]
+    fn tab_progress_prioritizes_attention_across_panes() {
+        assert_eq!(
+            aggregate_tab_progress([(Progress::Indeterminate, false), (Progress::None, true)]),
+            Progress::Paused
+        );
+        assert_eq!(
+            aggregate_tab_progress([(Progress::Percentage(50), false), (Progress::Paused, false)]),
+            Progress::Paused
+        );
+    }
+
+    #[test]
+    fn tab_progress_ignores_running_panes() {
+        assert_eq!(
+            aggregate_tab_progress([(Progress::None, false), (Progress::Percentage(25), false),]),
+            Progress::None
+        );
+        assert_eq!(
+            aggregate_tab_progress([(Progress::Indeterminate, false)]),
+            Progress::None
+        );
+        assert_eq!(
+            aggregate_tab_progress([(Progress::None, false)]),
+            Progress::None
+        );
+    }
 
     #[test]
     fn other_user_vars_never_trigger_reload() {
