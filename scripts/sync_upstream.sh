@@ -166,6 +166,16 @@ PY
   git add "$file"
 }
 
+refresh_cargo_lock() {
+  echo "Refreshing Cargo.lock to match merged manifests..."
+  # The upstream lockfile does not know about fork-only dependencies such as
+  # rust-i18n. Generate the minimal resolver update before the locked check;
+  # otherwise the check would modify the worktree after the merge commit and
+  # the workflow would push a commit that cannot reproduce its own build.
+  cargo generate-lockfile
+  git add Cargo.lock
+}
+
 resolve_highlights_conflict() {
   local file="assets/shell-integration/config_update_highlights.tsv"
   if ! is_conflicted "$file"; then
@@ -413,6 +423,7 @@ if [ "$merge_status" -ne 0 ]; then
   resolve_manifest kaku/Cargo.toml
   resolve_manifest kaku-gui/Cargo.toml
   resolve_cargo_lock
+  refresh_cargo_lock
   resolve_config_version
   ensure_audit_step
   resolve_locales
@@ -431,6 +442,7 @@ else
   # A clean merge is already committed. Apply invariant repairs, if any, as a
   # small follow-up commit rather than silently dropping them.
   resolve_cargo_lock
+  refresh_cargo_lock
   resolve_config_version
   ensure_audit_step
   if ! git diff --quiet || ! git diff --cached --quiet; then
