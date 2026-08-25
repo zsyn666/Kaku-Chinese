@@ -36,7 +36,8 @@ mod imp {
     use std::process::{Command, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    const RELEASE_API_URL: &str = "https://api.github.com/repos/zsyn666/Kaku-Chinese/releases/latest";
+    const RELEASE_API_URL: &str =
+        "https://api.github.com/repos/zsyn666/Kaku-Chinese/releases/latest";
     const RELEASE_LATEST_URL: &str = "https://github.com/zsyn666/Kaku-Chinese/releases/latest";
     const UPDATE_ZIP_NAME: &str = "kaku_for_update.zip";
     const UPDATE_SHA_NAME: &str = "kaku_for_update.zip.sha256";
