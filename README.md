@@ -2,7 +2,7 @@
   <img src="https://gw.alipayobjects.com/zos/k/6h/dwarf.svg" width="120" />
   <h1>Kaku</h1>
   <p><em>A fast, out-of-the-box terminal built for AI coding.</em></p>
-  <p><strong>🇨🇳 中文版 — 默认启用简体中文 UI (设置 <code>config.language = "en"</code> 切回英文)</strong></p>
+  <p><a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a></p>
 </div>
 
 <p align="center">
@@ -16,6 +16,42 @@
 <p align="center">
   <img src="assets/kaku.jpg" alt="Kaku Screenshot" width="1000" />
 </p>
+
+## Fork Overview
+
+This repository is a [zsyn666](https://github.com/zsyn666) maintained fork of
+[tw93/Kaku](https://github.com/tw93/Kaku). It stays track of upstream `main`
+while providing three enhancements:
+
+- **Simplified Chinese UI by default**: The application ships with `zh-CN` as
+  the default UI language via `rust-i18n` (derived from upstream PR #362),
+  with `locales/zh-CN.yml` and `locales/en.yml` kept in parity. Set
+  `config.language = "en"` in `kaku.lua` to switch back to English.
+- **ARM64 and x86-64 dual-architecture support**: `make app` builds a
+  universal binary (fat `arm64 + x86_64`) by default. CI builds and releases
+  three packages in parallel — `Kaku.dmg` (universal), `Kaku-arm64.dmg`
+  (Apple Silicon), and `Kaku-x64.dmg` (Intel) — along with matching
+  `kaku_for_update*.zip` archives, each verified with `lipo -verify_arch`.
+- **Automatic upstream merge**: A scheduled GitHub Actions workflow
+  (`.github/workflows/sync-upstream.yml`, daily at 03:00 UTC) fetches
+  `tw93/Kaku@main` and merges it with `--no-ff`. Whitelisted files
+  (`Cargo.lock`, `config_version.txt`, release-guide docs, `locales/*.yml`,
+  `audit.yml`) are auto-resolved; any other conflict aborts the merge for
+  manual triage. The workflow can also be triggered manually via
+  `workflow_dispatch`.
+
+| Aspect | Upstream `tw93/Kaku` | This fork `zsyn666/Kaku-Chinese` |
+|---|---|---|
+| Default language | English | Simplified Chinese (`config.language = "en"` to switch back) |
+| Release artifacts | Single universal `Kaku.dmg` | `Kaku.dmg` (universal) + `Kaku-arm64.dmg` + `Kaku-x64.dmg`, with per-arch update zips |
+| Local builds | `make app` = native single-arch | `make app` = universal; `make app-native` / `app-arm64` / `app-x64` available |
+| CI runtime | Sequential universal build (~30 min) | Parallel 3-runner matrix (universal / arm64 / x64, ~12 min) |
+| Upstream sync | n/a | Daily 03:00 UTC auto-merge with whitelisted resolution |
+| Maintainer | `tw93` | `zsyn666` (this fork only; the `vercel` docs site still belongs to upstream) |
+
+**Download guidance**: Apple Silicon users may prefer `Kaku-arm64.dmg` for the
+smallest download, Intel users `Kaku-x64.dmg`, and `Kaku.dmg` when in doubt.
+All packages target macOS 11.0+.
 
 ## Why
 
@@ -34,10 +70,10 @@ Part of a trilogy: [Kaku](https://github.com/tw93/Kaku) (書く) writes code, [W
 
 ## Quick Start
 
-1. [Download Kaku DMG](https://github.com/tw93/Kaku/releases/latest) & Drag to Applications
-2. Or install with Homebrew: `brew install tw93/tap/kakuku`
-3. Open Kaku. The app is notarized by Apple, so it opens without security warnings
-4. On first launch, Kaku will automatically set up your shell environment
+1. [Download Kaku DMG](https://github.com/zsyn666/Kaku-Chinese/releases/latest) (universal, arm64, or x64 variant) and drag it to Applications.
+2. Or install a package manager: `brew install tw93/tap/kakuku` (upstream cask may require the tap).
+3. Open Kaku. Releases are notarized by Apple and open without security warnings.
+4. On first launch, Kaku sets up your shell environment automatically. The default UI is Simplified Chinese; set `config.language = "en"` in `~/.config/kaku/kaku.lua` for English.
 
 ## Usage Guide
 
@@ -127,9 +163,9 @@ Big thanks to all contributors who helped build Kaku. Go follow them! ❤️
 
 ## Support
 
-- The most direct way to support me is getting [Mole for Mac](https://mole.fit), my paid Mac cleanup app.
+- The most direct way to support the upstream author is getting [Mole for Mac](https://mole.fit), their paid Mac cleanup app.
 - If Kaku helped you, give it a star, [share it](https://twitter.com/intent/tweet?url=https://github.com/tw93/Kaku&text=Kaku%20-%20A%20fast%20terminal%20built%20for%20AI%20coding.), or open an issue or PR.
-- I have two cats, TangYuan and Coke. If you think Kaku delights your life, you can feed them <a href="https://cats.tw93.fun?name=Kaku" target="_blank">canned food 🥩</a>.
+- Upstream has two cats, TangYuan and Coke. You can feed them <a href="https://cats.tw93.fun?name=Kaku" target="_blank">canned food 🥩</a>.
 
 <details>
 <summary>These lovely people already did 🐱</summary>
