@@ -30,7 +30,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$REPO_ROOT"
 
-GITHUB_REPO="${GITHUB_REPO:-tw93/Kaku}"
+GITHUB_REPO="${GITHUB_REPO:-zsyn666/Kaku-Chinese}"
 NIGHTLY_TAG="${NIGHTLY_TAG:-nightly}"
 PROFILE="${PROFILE:-release-opt}"
 OUT_DIR="${OUT_DIR:-$REPO_ROOT/dist}"

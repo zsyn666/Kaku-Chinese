@@ -36,15 +36,41 @@ mod imp {
     use std::process::{Command, Stdio};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    const RELEASE_API_URL: &str = "https://api.github.com/repos/tw93/Kaku/releases/latest";
-    const LATEST_ZIP_URL: &str =
-        "https://github.com/tw93/Kaku/releases/latest/download/kaku_for_update.zip";
-    const LATEST_SHA_URL: &str =
-        "https://github.com/tw93/Kaku/releases/latest/download/kaku_for_update.zip.sha256";
-    const RELEASE_LATEST_URL: &str = "https://github.com/tw93/Kaku/releases/latest";
+    const RELEASE_API_URL: &str = "https://api.github.com/repos/zsyn666/Kaku-Chinese/releases/latest";
+    const RELEASE_LATEST_URL: &str = "https://github.com/zsyn666/Kaku-Chinese/releases/latest";
     const UPDATE_ZIP_NAME: &str = "kaku_for_update.zip";
     const UPDATE_SHA_NAME: &str = "kaku_for_update.zip.sha256";
-    const BREW_CASK_NAME: &str = "tw93/tap/kakuku";
+    const BREW_CASK_NAME: &str = "zsyn666/tap/kaku-chinese";
+
+    fn arch_suffix() -> &'static str {
+        match std::env::consts::ARCH {
+            "aarch64" => "-arm64",
+            "x86_64" => "-x64",
+            _ => "",
+        }
+    }
+
+    fn arch_update_zip_name() -> String {
+        format!("kaku_for_update{}.zip", arch_suffix())
+    }
+
+    fn arch_update_sha_name() -> String {
+        format!("kaku_for_update{}.zip.sha256", arch_suffix())
+    }
+
+    fn latest_zip_url() -> String {
+        format!(
+            "https://github.com/zsyn666/Kaku-Chinese/releases/latest/download/kaku_for_update{}.zip",
+            arch_suffix()
+        )
+    }
+
+    fn latest_sha_url() -> String {
+        format!(
+            "https://github.com/zsyn666/Kaku-Chinese/releases/latest/download/kaku_for_update{}.zip.sha256",
+            arch_suffix()
+        )
+    }
 
     #[derive(Debug, Deserialize)]
     struct GitHubRelease {
@@ -158,23 +184,29 @@ mod imp {
         // never a floating `latest` one: mixing a pinned artifact with a
         // floating hash can falsely abort a good update or verify the wrong
         // build. Only fall back to the latest pair when the ZIP itself does.
-        let (zip_url, sha_url) = match release.as_ref() {
+        // Prefer per-arch asset when available (e.g. kaku_for_update-arm64.zip),
+        // fall back to universal for backward compatibility.
+        let arch_zip = arch_update_zip_name();
+        let arch_sha = arch_update_sha_name();
+        let (zip_url, sha_url): (String, String) = match release.as_ref() {
             Some(rel) => {
-                let zip = find_asset(&rel.assets, UPDATE_ZIP_NAME)
-                    .map(|a| a.browser_download_url.as_str());
-                let sha = find_asset(&rel.assets, UPDATE_SHA_NAME)
-                    .map(|a| a.browser_download_url.as_str());
+                let zip = find_asset(&rel.assets, &arch_zip)
+                    .or_else(|| find_asset(&rel.assets, UPDATE_ZIP_NAME))
+                    .map(|a| a.browser_download_url.clone());
+                let sha = find_asset(&rel.assets, &arch_sha)
+                    .or_else(|| find_asset(&rel.assets, UPDATE_SHA_NAME))
+                    .map(|a| a.browser_download_url.clone());
                 match (zip, sha) {
                     (Some(zip), Some(sha)) => (zip, sha),
                     (Some(_), None) => bail!(
                         "release `{}` is missing checksum asset `{}`; refusing to install an unverified build",
                         rel.tag_name,
-                        UPDATE_SHA_NAME
+                        arch_sha
                     ),
-                    _ => (LATEST_ZIP_URL, LATEST_SHA_URL),
+                    _ => (latest_zip_url(), latest_sha_url()),
                 }
             }
-            None => (LATEST_ZIP_URL, LATEST_SHA_URL),
+            None => (latest_zip_url(), latest_sha_url()),
         };
 
         let update_root = config::DATA_DIR.join("updates");
@@ -191,15 +223,15 @@ mod imp {
         let work_dir = update_root.join(format!("{}-{}", tag, now));
         config::create_user_owned_dirs(&work_dir).context("create update work directory")?;
 
-        let zip_path = work_dir.join(UPDATE_ZIP_NAME);
-        println!("Downloading {} ...", UPDATE_ZIP_NAME);
+        let zip_path = work_dir.join(&arch_zip);
+        println!("Downloading {} ...", arch_zip);
         // Flush stdout before curl progress bar to avoid garbled output
         let _ = io::stdout().flush();
-        curl_download_to_file(zip_url, &zip_path, &current_version, &proxy)
+        curl_download_to_file(&zip_url, &zip_path, &current_version, &proxy)
             .context("failed to download update package")?;
 
         println!("Verifying package checksum...");
-        let checksum_text = curl_get_text(sha_url, &current_version, &proxy).context(
+        let checksum_text = curl_get_text(&sha_url, &current_version, &proxy).context(
             "failed to fetch checksum; aborting to avoid installing an unverified build",
         )?;
         verify_sha256(&zip_path, &checksum_text).context("checksum verification failed")?;

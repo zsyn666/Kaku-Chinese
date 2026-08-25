@@ -41,10 +41,36 @@ const STAGED_LOCK_NAME: &str = "staged_update.lock";
 const STAGED_META_NAME: &str = "metadata.json";
 const UPDATE_ZIP_NAME: &str = "kaku_for_update.zip";
 const UPDATE_SHA_NAME: &str = "kaku_for_update.zip.sha256";
-const LATEST_ZIP_URL: &str =
-    "https://github.com/tw93/Kaku/releases/latest/download/kaku_for_update.zip";
-const LATEST_SHA_URL: &str =
-    "https://github.com/tw93/Kaku/releases/latest/download/kaku_for_update.zip.sha256";
+
+fn arch_suffix() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "-arm64",
+        "x86_64" => "-x64",
+        _ => "",
+    }
+}
+
+fn arch_update_zip_name() -> String {
+    format!("kaku_for_update{}.zip", arch_suffix())
+}
+
+fn arch_update_sha_name() -> String {
+    format!("kaku_for_update{}.zip.sha256", arch_suffix())
+}
+
+fn latest_zip_url() -> String {
+    format!(
+        "https://github.com/zsyn666/Kaku-Chinese/releases/latest/download/kaku_for_update{}.zip",
+        arch_suffix()
+    )
+}
+
+fn latest_sha_url() -> String {
+    format!(
+        "https://github.com/zsyn666/Kaku-Chinese/releases/latest/download/kaku_for_update{}.zip.sha256",
+        arch_suffix()
+    )
+}
 /// Staged updates older than this are considered expired.
 const STAGED_MAX_AGE_SECS: u64 = 7 * 24 * 3600;
 
@@ -198,7 +224,7 @@ fn curl_get_release_json(url: &str, proxy: &Option<String>) -> anyhow::Result<Re
 pub fn get_latest_release_info() -> anyhow::Result<Release> {
     let proxy = detect_system_proxy();
     curl_get_release_json(
-        "https://api.github.com/repos/tw93/Kaku/releases/latest",
+        "https://api.github.com/repos/zsyn666/Kaku-Chinese/releases/latest",
         &proxy,
     )
     .or_else(|_| get_latest_tag_via_redirect(&proxy))
@@ -218,7 +244,7 @@ fn get_latest_tag_via_redirect(proxy: &Option<String>) -> anyhow::Result<Release
         .arg("%{url_effective}")
         .arg("--output")
         .arg("/dev/null")
-        .arg("https://github.com/tw93/Kaku/releases/latest");
+        .arg("https://github.com/zsyn666/Kaku-Chinese/releases/latest");
     apply_to_command(&mut cmd, proxy);
 
     let output = cmd.output().map_err(|e| anyhow!("curl failed: {}", e))?;
@@ -238,7 +264,7 @@ fn get_latest_tag_via_redirect(proxy: &Option<String>) -> anyhow::Result<Release
     Ok(Release {
         url: String::new(),
         body: String::new(),
-        html_url: "https://github.com/tw93/Kaku/releases/latest".to_string(),
+        html_url: "https://github.com/zsyn666/Kaku-Chinese/releases/latest".to_string(),
         tag_name: tag.to_string(),
         assets: vec![],
     })
@@ -248,7 +274,7 @@ fn get_latest_tag_via_redirect(proxy: &Option<String>) -> anyhow::Result<Release
 pub fn get_nightly_release_info() -> anyhow::Result<Release> {
     let proxy = detect_system_proxy();
     curl_get_release_json(
-        "https://api.github.com/repos/tw93/Kaku/releases/tags/nightly",
+        "https://api.github.com/repos/zsyn666/Kaku-Chinese/releases/tags/nightly",
         &proxy,
     )
 }
@@ -476,18 +502,21 @@ fn download_and_stage_update(
     config::create_user_owned_dirs(&dir)
         .map_err(|e| anyhow!("failed to create staged update dir: {}", e))?;
 
-    let zip_url = find_asset(&release.assets, UPDATE_ZIP_NAME)
-        .map(|a| a.browser_download_url.as_str())
-        .unwrap_or(LATEST_ZIP_URL);
-
-    let sha_url = find_asset(&release.assets, UPDATE_SHA_NAME)
-        .map(|a| a.browser_download_url.as_str())
-        .unwrap_or(LATEST_SHA_URL);
+    let arch_zip = arch_update_zip_name();
+    let arch_sha = arch_update_sha_name();
+    let zip_url = find_asset(&release.assets, &arch_zip)
+        .or_else(|| find_asset(&release.assets, UPDATE_ZIP_NAME))
+        .map(|a| a.browser_download_url.clone())
+        .unwrap_or_else(latest_zip_url);
+    let sha_url = find_asset(&release.assets, &arch_sha)
+        .or_else(|| find_asset(&release.assets, UPDATE_SHA_NAME))
+        .map(|a| a.browser_download_url.clone())
+        .unwrap_or_else(latest_sha_url);
 
     // 1. Download zip
-    let zip_path = dir.join(UPDATE_ZIP_NAME);
-    log::info!("staged update: downloading {} ...", UPDATE_ZIP_NAME);
-    curl_download_to_file(zip_url, &zip_path, proxy)?;
+    let zip_path = dir.join(&arch_zip);
+    log::info!("staged update: downloading {} ...", arch_zip);
+    curl_download_to_file(&zip_url, &zip_path, proxy)?;
 
     // 2. Verify SHA256
     log::info!("staged update: verifying checksum...");
